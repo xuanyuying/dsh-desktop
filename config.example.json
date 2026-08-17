@@ -1,0 +1,5 @@
+{
+  "_说明": "DeepSeek Harness 桌面版 - API Key 配置文件模板",
+  "_用法": "复制本文件到 ~/.dsh-desktop/config.json，将 apiKey 替换为你的 DeepSeek API Key（https://platform.deepseek.com 获取）",
+  "apiKey": "sk-在此填入你的DeepSeek-API-Key"
+}

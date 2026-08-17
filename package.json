@@ -1,0 +1,42 @@
+{
+  "name": "dsh-desktop",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness 桌面端启动软件 - 内置完整预览版功能，左下角实时显示账户余额",
+  "main": "src/main.js",
+  "author": "DSH Desktop",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist": "electron-builder --win",
+    "verify": "node scripts/smoke-test.js && node scripts/test-lib.js && node scripts/test-preload.js",
+    "headless-test": "electron . --headless-test"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.deepseek.dshdesktop",
+    "productName": "DSH Desktop",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "npmRebuild": false,
+    "buildDependenciesFromSource": false,
+    "electronDist": "node_modules/electron/dist",
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  }
+}

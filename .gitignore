@@ -1,0 +1,23 @@
+# 依赖与构建产物
+node_modules/
+dist/
+out/
+release/
+*.log
+
+# 本地缓存（勿上传）
+.npm-cache/
+.electron-cache/
+.builder-cache/
+
+# 本地 API Key 配置（勿上传，仅保留模板 config.example.json）
+config.json
+.dsh-desktop/
+*.local.json
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
