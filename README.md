@@ -2,10 +2,29 @@
 
 一个基于 **Electron** 的 Windows 桌面应用，用于启动并承载 **DeepSeek Harness** 的完整 Web 界面（对话、插件、技能、工作流、子代理、设置等全部功能），并在窗口**右下角实时显示 DeepSeek 账户余额**。
 
-![技术栈](https://img.shields.io/badge/Electron-43-blue) ![平台](https://img.shields.io/badge/Windows-Win10%2B-brightgreen)
+![技术栈](https://img.shields.io/badge/Electron-43-blue) ![平台](https://img.shields.io/badge/Windows-Win10%2B-brightgreen) ![License](https://img.shields.io/badge/License-MIT-green) ![Release](https://img.shields.io/github/v/release/xuanyuying/dsh-desktop)
 
 > 💡 **通用版**：不含任何个人 API Key，开箱即用，配置你自己的 Key 即可。
 > 💡 **无需 Visual Studio / 任何 IDE**：Node.js + Electron，命令行即可运行、测试、打包。
+
+---
+
+## 📸 运行截图
+
+![DSH Desktop 运行截图](docs/screenshot.png)
+
+## ⬇️ 下载安装
+
+前往 [Releases 页面](https://github.com/xuanyuying/dsh-desktop/releases) 下载 **`DSH Desktop Setup 1.0.0.exe`** 安装程序（Windows 10/11，约 95 MB）。
+
+或克隆源码自行构建：
+
+```powershell
+git clone https://github.com/xuanyuying/dsh-desktop.git
+cd dsh-desktop
+npm install
+npm start
+```
 
 ---
 
