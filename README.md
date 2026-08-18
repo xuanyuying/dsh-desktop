@@ -6,6 +6,7 @@
 
 > 💡 **通用版**：不含任何个人 API Key，开箱即用，配置你自己的 Key 即可。
 > 💡 **无需 Visual Studio / 任何 IDE**：Node.js + Electron，命令行即可运行、测试、打包。
+> 🧩 **DeepSeek Harness 社区项目**：本应用是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）生态的桌面客户端，通过 `dsh-plugin` 主题与官方社区关联。
 
 ---
 
