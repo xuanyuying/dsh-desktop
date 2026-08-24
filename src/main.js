@@ -2,9 +2,9 @@
  * DSH Desktop - 主进程
  *
  * DeepSeek Harness 桌面端启动软件
- * - 检测/启动 dsh web 服务
- * - 加载完整预览版 Web UI
- * - 左下角实时显示 DeepSeek 账户余额
+ * - 检测/启动 dsh web 服务（单实例锁防多开）
+ * - 加载完整预览版 Web UI（含加载失败重试）
+ * - 右下角实时显示 DeepSeek 账户余额
  */
 'use strict';
 
@@ -15,6 +15,26 @@ const harness = require('./lib/harness');
 const balance = require('./lib/balance');
 
 const BALANCE_REFRESH_MS = 30 * 1000; // 余额实时刷新间隔 30s
+const PAGE_LOAD_RETRY_MS = 3000;      // 页面加载失败重试间隔
+const PAGE_LOAD_MAX_RETRY = 5;        // 页面加载最大重试次数
+
+// ---------------------------------------------------------------------------
+// 单实例锁：防止多次启动导致多个 Electron 进程与多个 dsh 服务
+// ---------------------------------------------------------------------------
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  // 已有实例在运行，退出当前实例
+  console.log('[dsh-desktop] 已有实例运行，退出重复启动');
+  app.quit();
+} else {
+  // 第二个实例启动时，聚焦已有窗口
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // 余额轮询
@@ -52,8 +72,11 @@ function stopBalancePolling() {
 // ---------------------------------------------------------------------------
 
 let mainWindow = null;
+let pageLoadRetry = 0;
 
 function createMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return; // 防重复创建
+
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -70,7 +93,7 @@ function createMainWindow() {
     },
   });
 
-  mainWindow.loadURL(harness.HARNESS_URL);
+  loadMainPage();
 
   // 外链用系统浏览器打开
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -79,12 +102,35 @@ function createMainWindow() {
   });
 
   mainWindow.webContents.on('did-finish-load', () => {
+    pageLoadRetry = 0;
     logService(`已连接 ${harness.HARNESS_URL}`);
+  });
+
+  // 页面加载失败：重试（服务可能还在启动）
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (!isMainFrame || url !== harness.HARNESS_URL) return;
+    if (pageLoadRetry < PAGE_LOAD_MAX_RETRY) {
+      pageLoadRetry++;
+      logService(`页面加载失败(${code} ${desc})，${PAGE_LOAD_RETRY_MS / 1000}s 后重试 (${pageLoadRetry}/${PAGE_LOAD_MAX_RETRY})`);
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.loadURL(harness.HARNESS_URL);
+        }
+      }, PAGE_LOAD_RETRY_MS);
+    } else {
+      logService('页面加载重试次数已用尽');
+      mainWindow.webContents.send('fatal:error', `页面加载失败：${desc}`);
+    }
   });
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    pageLoadRetry = 0;
   });
+}
+
+function loadMainPage() {
+  mainWindow.loadURL(harness.HARNESS_URL);
 }
 
 function logService(msg) {
@@ -119,7 +165,7 @@ ipcMain.on('app:quit', () => {
 async function bootstrap() {
   apiKey = balance.resolveApiKey();
 
-  // 1. 确保服务运行
+  // 1. 确保服务运行（等就绪再加载页面）
   const { started } = await harness.ensureHarnessRunning();
   logService(started ? 'dsh web 服务已由本应用启动' : '复用已运行的 dsh web 服务');
 

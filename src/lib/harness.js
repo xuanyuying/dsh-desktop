@@ -49,12 +49,15 @@ async function isHarnessReady() {
   }
 }
 
-/** 等待服务就绪 */
+/** 等待服务就绪（指数退避，避免 CPU 空转） */
 async function waitForHarness(timeoutMs = STARTUP_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
+  let delay = 500;
   while (Date.now() < deadline) {
     if (await isHarnessReady()) return true;
-    await new Promise((r) => setTimeout(r, 1000));
+    // 指数退避：500ms → 1s → 2s → 4s → 封顶 5s
+    await new Promise((r) => setTimeout(r, delay));
+    delay = Math.min(delay * 2, 5000);
   }
   return isHarnessReady();
 }
