@@ -151,6 +151,7 @@ function resolvePackageEntry(pkgDir) {
 
 /**
  * 确保 dsh web 服务在运行。
+ * 自动执行启动前提：定位 dsh（必要时自动安装）→ 启动 dsh web → 等待就绪。
  * @returns {Promise<{started: boolean, entry: object|null}>}
  */
 async function ensureHarnessRunning() {
@@ -159,36 +160,152 @@ async function ensureHarnessRunning() {
     return { started: false, entry: null };
   }
 
-  const dshEntry = findDshEntry();
+  // 前提 1：定位 dsh 入口（找不到则自动安装）
+  let dshEntry = findDshEntry();
+  if (!dshEntry) {
+    logLine('未找到 dsh 命令，自动安装 @deepseek-ai/dsh ...');
+    dshEntry = await autoInstallDsh();
+  }
   if (!dshEntry) {
     throw new Error(
-      '未找到 dsh 命令。请先安装 DeepSeek Harness（npm install -g @deepseek-ai/dsh）'
+      '未找到 dsh 命令且自动安装失败。请手动执行：npm install -g @deepseek-ai/dsh'
     );
   }
 
+  // 前提 2：启动 dsh web（多方式重试）
+  let started = false;
+  const attempts = [
+    { entry: dshEntry, label: 'node+bin.js' },
+  ];
+  // 若主入口是 node+bin.js，追加 .cmd 备选；反之亦然
+  if (dshEntry.script) {
+    const cmdEntry = findDshCmdEntry();
+    if (cmdEntry) attempts.push({ entry: cmdEntry, label: 'dsh.cmd' });
+  } else {
+    const nodeEntry = findDshNodeEntry();
+    if (nodeEntry) attempts.unshift({ entry: nodeEntry, label: 'node+bin.js' });
+  }
+
+  for (const attempt of attempts) {
+    logLine(`启动 dsh web (${attempt.label})...`);
+    started = await trySpawnWeb(attempt.entry);
+    if (started) break;
+    logLine(`方式 ${attempt.label} 启动失败，尝试下一种...`);
+  }
+
+  if (!started) {
+    throw new Error('dsh web 服务启动失败，请检查 dsh 安装（npm install -g @deepseek-ai/dsh）');
+  }
+  startedByUs = true;
+  return { started: true, entry: dshEntry };
+}
+
+/** 尝试 spawn dsh web 并等待就绪 */
+async function trySpawnWeb(dshEntry) {
   const args = dshEntry.script
     ? [dshEntry.script, 'web', '--port', String(HARNESS_PORT)]
     : ['web', '--port', String(HARNESS_PORT)];
 
-  harnessProcess = spawn(dshEntry.command, args, {
-    env: { ...process.env },
-    cwd: os.homedir(),
-    detached: false,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-    shell: !dshEntry.script,
-  });
+  return new Promise((resolve) => {
+    let child = null;
+    try {
+      child = spawn(dshEntry.command, args, {
+        env: { ...process.env },
+        cwd: os.homedir(),
+        detached: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: !dshEntry.script,
+      });
+    } catch (e) {
+      logLine(`spawn 失败: ${e.message}`);
+      resolve(false);
+      return;
+    }
 
-  harnessProcess.on('exit', (code) => {
-    harnessProcess = null;
-  });
+    harnessProcess = child;
+    child.on('exit', (code) => {
+      harnessProcess = null;
+      logLine(`dsh web 进程退出 code=${code}`);
+      resolve(false);
+    });
+    child.on('error', (e) => {
+      logLine(`dsh web 进程错误: ${e.message}`);
+      harnessProcess = null;
+      resolve(false);
+    });
 
-  const ok = await waitForHarness();
-  if (!ok) {
-    throw new Error('dsh web 服务启动超时，请检查控制台日志');
+    // 等待就绪（最多 30s）
+    const deadline = Date.now() + 30000;
+    const probe = async () => {
+      if (await isHarnessReady()) {
+        resolve(true);
+        return;
+      }
+      if (Date.now() > deadline) {
+        logLine('dsh web 启动超时(30s)');
+        resolve(false);
+        return;
+      }
+      setTimeout(probe, 1000);
+    };
+    probe();
+  });
+}
+
+/** 自动安装 dsh 到全局 */
+async function autoInstallDsh() {
+  logLine('运行 npm install -g @deepseek-ai/dsh ...');
+  return new Promise((resolve) => {
+    try {
+      const child = spawn('npm', ['install', '-g', '@deepseek-ai/dsh'], {
+        env: { ...process.env },
+        cwd: os.homedir(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: true,
+      });
+      child.on('exit', () => {
+        // 安装后重新定位
+        resolve(findDshEntry());
+      });
+      child.on('error', () => resolve(null));
+      // 10 分钟超时兜底
+      setTimeout(() => resolve(findDshEntry()), 10 * 60 * 1000);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/** 通过 PATH 查找 dsh.cmd */
+function findDshCmdEntry() {
+  const explicit = process.env.DSH_BIN;
+  if (explicit && fs.existsSync(explicit)) return { command: explicit };
+  const pathDirs = (process.env.PATH || '').split(path.delimiter);
+  for (const dir of pathDirs) {
+    for (const name of ['dsh.cmd', 'dsh.bat', 'dsh']) {
+      const full = path.join(dir, name);
+      if (fs.existsSync(full)) return { command: full };
+    }
   }
-  startedByUs = true;
-  return { started: true, entry: dshEntry };
+  return null;
+}
+
+/** 通过 node+bin.js 查找（复用 findDshEntry 的包定位逻辑） */
+function findDshNodeEntry() {
+  return findDshEntry();
+}
+
+/** 日志行（写 stderr，EPIPE 安全） */
+function logLine(msg) {
+  try {
+    if (process.stderr && !process.stderr.destroyed) {
+      process.stderr.write('[dsh] ' + String(msg).trim() + '\n');
+    }
+  } catch {
+    /* EPIPE 静默 */
+  }
 }
 
 /** 停止由本应用启动的服务 */
@@ -221,6 +338,7 @@ module.exports = {
   findDshEntry,
   ensureHarnessRunning,
   stopHarnessIfOwned,
+  autoInstallDsh,
   get startedByUs() {
     return startedByUs;
   },
