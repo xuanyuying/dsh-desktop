@@ -1,10 +1,9 @@
 /**
- * DSH Desktop - 主进程
- *
- * DeepSeek Harness 桌面端启动软件
- * - 检测/启动 dsh web 服务（单实例锁防多开）
- * - 加载完整预览版 Web UI（含加载失败重试）
- * - 右下角实时显示 DeepSeek 账户余额
+ * DSH Desktop - Main process
+ * - Single instance lock (prevent multi-open)
+ * - Launch/reuse dsh web service
+ * - Load full Web UI (with retry + service watch)
+ * - Real-time balance display
  */
 'use strict';
 
@@ -14,20 +13,53 @@ const path = require('node:path');
 const harness = require('./lib/harness');
 const balance = require('./lib/balance');
 
-const BALANCE_REFRESH_MS = 30 * 1000; // 余额实时刷新间隔 30s
-const PAGE_LOAD_RETRY_MS = 3000;      // 页面加载失败重试间隔
-const PAGE_LOAD_MAX_RETRY = 5;        // 页面加载最大重试次数
+const BALANCE_REFRESH_MS = 30 * 1000; // 30s balance refresh
+const PAGE_LOAD_RETRY_MS = 3000;      // page reload retry interval
+const PAGE_LOAD_MAX_RETRY = 5;        // max retry count
 
 // ---------------------------------------------------------------------------
-// 单实例锁：防止多次启动导致多个 Electron 进程与多个 dsh 服务
+// Safe logging: packaged exe launched from desktop has invalid stdout pipe.
+// console.log writing to stdout throws EPIPE: broken pipe => main process crash.
+// Use safeLog (writes to stdout only if valid, silently ignores EPIPE).
+// ---------------------------------------------------------------------------
+function safeLog(...args) {
+  try {
+    if (process.stdout && !process.stdout.destroyed) {
+      process.stdout.write(args.map(String).join(' ').trimEnd() + '\n');
+    }
+  } catch (e) {
+    if (e && e.code !== 'EPIPE') {
+      try {
+        console.error(String(e && e.message));
+      } catch {
+        /* silent */
+      }
+    }
+  }
+}
+
+// Guard stdout/stderr EPIPE and uncaught errors so the window stays alive.
+try {
+  process.stdout.on('error', (e) => { if (e && e.code === 'EPIPE') { /* ignore */ } });
+  process.stderr.on('error', (e) => { if (e && e.code === 'EPIPE') { /* ignore */ } });
+  process.on('uncaughtException', (err) => {
+    try { process.stderr.write('[uncaught] ' + (err && err.message) + '\n'); } catch { /* silent */ }
+  });
+  process.on('unhandledRejection', (reason) => {
+    try { process.stderr.write('[unhandledRejection] ' + (reason && reason.message) + '\n'); } catch { /* silent */ }
+  });
+} catch {
+  /* ignore */
+}
+
+// ---------------------------------------------------------------------------
+// Single instance lock
 // ---------------------------------------------------------------------------
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
-  // 已有实例在运行，退出当前实例
-  console.log('[dsh-desktop] 已有实例运行，退出重复启动');
+  safeLog('[dsh-desktop] existing instance running, quit duplicate');
   app.quit();
 } else {
-  // 第二个实例启动时，聚焦已有窗口
   app.on('second-instance', () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
@@ -37,7 +69,7 @@ if (!gotLock) {
 }
 
 // ---------------------------------------------------------------------------
-// 余额轮询
+// Balance polling
 // ---------------------------------------------------------------------------
 
 let balanceTimer = null;
@@ -68,7 +100,7 @@ function stopBalancePolling() {
 }
 
 // ---------------------------------------------------------------------------
-// 窗口
+// Window
 // ---------------------------------------------------------------------------
 
 let mainWindow = null;
@@ -77,7 +109,7 @@ let pageReady = false;
 let pageWatchTimer = null;
 
 function createMainWindow() {
-  if (mainWindow && !mainWindow.isDestroyed()) return; // 防重复创建
+  if (mainWindow && !mainWindow.isDestroyed()) return;
 
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -97,7 +129,6 @@ function createMainWindow() {
 
   loadMainPage();
 
-  // 外链用系统浏览器打开
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('http')) shell.openExternal(url);
     return { action: 'deny' };
@@ -107,28 +138,26 @@ function createMainWindow() {
     pageLoadRetry = 0;
     pageReady = true;
     stopPageWatch();
-    logService(`已连接 ${harness.HARNESS_URL}`);
+    logService('connected ' + harness.HARNESS_URL);
   });
 
-  // 页面加载失败：重试（服务可能还在启动）
   mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
     if (!isMainFrame || url !== harness.HARNESS_URL) return;
     pageReady = false;
     if (pageLoadRetry < PAGE_LOAD_MAX_RETRY) {
       pageLoadRetry++;
-      logService(`页面加载失败(${code} ${desc})，${PAGE_LOAD_RETRY_MS / 1000}s 后重试 (${pageLoadRetry}/${PAGE_LOAD_MAX_RETRY})`);
+      logService('page load failed(' + code + ' ' + desc + '), retry ' + (PAGE_LOAD_RETRY_MS / 1000) + 's (' + pageLoadRetry + '/' + PAGE_LOAD_MAX_RETRY + ')');
       setTimeout(() => {
         if (mainWindow && !mainWindow.isDestroyed() && !pageReady) {
           mainWindow.loadURL(harness.HARNESS_URL);
         }
       }, PAGE_LOAD_RETRY_MS);
     } else {
-      logService('页面加载重试次数已用尽，持续监听服务可用性...');
+      logService('page retry exhausted, watching service...');
       startPageWatch();
     }
   });
 
-  // 持续监听兜底：无论加载成功与否，服务后启动时自动重载
   startPageWatch();
 
   mainWindow.on('closed', () => {
@@ -144,17 +173,14 @@ function loadMainPage() {
   mainWindow.loadURL(harness.HARNESS_URL);
 }
 
-/**
- * 持续监听 dsh 服务可用性：一旦服务可用且页面未就绪，自动重新加载。
- * 解决"服务启动慢 / 服务后启动"导致页面空白、双击不显示的问题。
- */
+// Watch dsh service: once available and page not ready, auto-reload.
 function startPageWatch() {
   stopPageWatch();
   pageWatchTimer = setInterval(async () => {
     if (!mainWindow || mainWindow.isDestroyed() || pageReady) return;
     const ready = await harness.isHarnessReady();
     if (ready && !pageReady) {
-      logService('检测到 dsh 服务可用，自动重新加载页面...');
+      logService('dsh service available, auto reload...');
       mainWindow.loadURL(harness.HARNESS_URL);
     }
   }, 5000);
@@ -168,11 +194,11 @@ function stopPageWatch() {
 }
 
 function logService(msg) {
-  const line = `[dsh] ${msg.trim()}`;
+  const line = '[dsh] ' + String(msg).trim();
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('service:log', line);
   }
-  console.log(line);
+  safeLog(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,66 +219,63 @@ ipcMain.on('app:quit', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 生命周期
+// Lifecycle
 // ---------------------------------------------------------------------------
 
 async function bootstrap() {
   apiKey = balance.resolveApiKey();
 
-  // 1. 立即创建窗口（秒开），页面由服务监听自动加载
+  // 1. Open window immediately (fast), page loaded by service watch
   createMainWindow();
-  logService('窗口已打开，等待 dsh 服务...');
+  logService('window opened, waiting for dsh service...');
 
-  // 2. 异步确保服务运行（不阻塞窗口打开）
+  // 2. Ensure service running (async, not blocking window)
   try {
     const { started } = await harness.ensureHarnessRunning();
-    logService(started ? 'dsh web 服务已由本应用启动' : '复用已运行的 dsh web 服务');
+    logService(started ? 'dsh web service launched by app' : 'reusing running dsh web service');
   } catch (err) {
-    logService(`服务启动异常: ${err.message}`);
+    logService('service launch error: ' + err.message);
   }
 
-  // 3. 启动余额轮询
+  // 3. Start balance polling
   startBalancePolling();
 }
 
 function shutdownApp() {
   stopBalancePolling();
   const stopped = harness.stopHarnessIfOwned();
-  if (stopped) logService('已关闭本应用启动的 dsh 服务');
+  if (stopped) logService('closed dsh service launched by app');
   app.quit();
 }
 
-/**
- * 无 GUI 测试模式：验证服务启动与余额获取，随后自动退出。
- * 用法: electron . --headless-test
- */
+// Headless test mode: electron . --headless-test
 async function headlessTest() {
-  console.log('=== DSH Desktop headless test ===');
+  safeLog('=== DSH Desktop headless test ===');
   apiKey = balance.resolveApiKey();
-  console.log(`API Key: ${apiKey ? '已配置 (' + apiKey.slice(0, 6) + '...)' : '未配置'}`);
+  safeLog('API Key: ' + (apiKey ? 'configured (' + apiKey.slice(0, 6) + '...)' : 'not configured'));
 
   const { started } = await harness.ensureHarnessRunning();
-  console.log(`Harness: ${started ? '已由本应用启动' : '复用已运行服务'} @ ${harness.HARNESS_URL}`);
+  safeLog('Harness: ' + (started ? 'launched' : 'reused') + ' @ ' + harness.HARNESS_URL);
 
   const data = await balance.getBalanceData(apiKey);
   if (data.ok) {
     const lines = data.balances.map(
-      (b) => `${b.currency} 总余额 ${b.total_balance}（赠金 ${b.granted_balance} / 充值 ${b.topped_up_balance}）`
+      (b) => b.currency + ' total ' + b.total_balance + ' (granted ' + b.granted_balance + ' / topped ' + b.topped_up_balance + ')'
     );
-    console.log(`余额: ${lines.join('; ')}`);
-    console.log(`服务可用: ${data.isAvailable}`);
+    safeLog('Balance: ' + lines.join('; '));
+    safeLog('Available: ' + data.isAvailable);
   } else {
-    console.log(`余额获取失败: ${data.error}`);
+    safeLog('Balance fetch failed: ' + data.error);
   }
 
   harness.stopHarnessIfOwned();
-  console.log('=== headless test done ===');
+  safeLog('=== headless test done ===');
   app.exit(0);
 }
 
 if (process.argv.includes('--headless-test')) {
   app.whenReady().then(() => headlessTest().catch((err) => {
-    console.error('headless test 失败:', err.message);
+    safeLog('headless test failed: ' + err.message);
     app.exit(1);
   }));
 } else {
@@ -260,8 +283,7 @@ if (process.argv.includes('--headless-test')) {
     try {
       await bootstrap();
     } catch (err) {
-      console.error('[dsh-desktop] 启动失败:', err.message);
-      // 失败时仍打开窗口，展示错误信息
+      safeLog('[dsh-desktop] bootstrap failed: ' + err.message);
       createMainWindow();
       mainWindow.webContents.on('did-finish-load', () => {
         mainWindow.webContents.send('fatal:error', String(err.message || err));
