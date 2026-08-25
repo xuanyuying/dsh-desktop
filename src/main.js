@@ -73,6 +73,8 @@ function stopBalancePolling() {
 
 let mainWindow = null;
 let pageLoadRetry = 0;
+let pageReady = false;
+let pageWatchTimer = null;
 
 function createMainWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) return; // 防重复创建
@@ -103,34 +105,66 @@ function createMainWindow() {
 
   mainWindow.webContents.on('did-finish-load', () => {
     pageLoadRetry = 0;
+    pageReady = true;
+    stopPageWatch();
     logService(`已连接 ${harness.HARNESS_URL}`);
   });
 
   // 页面加载失败：重试（服务可能还在启动）
   mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
     if (!isMainFrame || url !== harness.HARNESS_URL) return;
+    pageReady = false;
     if (pageLoadRetry < PAGE_LOAD_MAX_RETRY) {
       pageLoadRetry++;
       logService(`页面加载失败(${code} ${desc})，${PAGE_LOAD_RETRY_MS / 1000}s 后重试 (${pageLoadRetry}/${PAGE_LOAD_MAX_RETRY})`);
       setTimeout(() => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
+        if (mainWindow && !mainWindow.isDestroyed() && !pageReady) {
           mainWindow.loadURL(harness.HARNESS_URL);
         }
       }, PAGE_LOAD_RETRY_MS);
     } else {
-      logService('页面加载重试次数已用尽');
-      mainWindow.webContents.send('fatal:error', `页面加载失败：${desc}`);
+      logService('页面加载重试次数已用尽，持续监听服务可用性...');
+      startPageWatch();
     }
   });
 
+  // 持续监听兜底：无论加载成功与否，服务后启动时自动重载
+  startPageWatch();
+
   mainWindow.on('closed', () => {
+    stopPageWatch();
     mainWindow = null;
     pageLoadRetry = 0;
+    pageReady = false;
   });
 }
 
 function loadMainPage() {
+  pageReady = false;
   mainWindow.loadURL(harness.HARNESS_URL);
+}
+
+/**
+ * 持续监听 dsh 服务可用性：一旦服务可用且页面未就绪，自动重新加载。
+ * 解决"服务启动慢 / 服务后启动"导致页面空白、双击不显示的问题。
+ */
+function startPageWatch() {
+  stopPageWatch();
+  pageWatchTimer = setInterval(async () => {
+    if (!mainWindow || mainWindow.isDestroyed() || pageReady) return;
+    const ready = await harness.isHarnessReady();
+    if (ready && !pageReady) {
+      logService('检测到 dsh 服务可用，自动重新加载页面...');
+      mainWindow.loadURL(harness.HARNESS_URL);
+    }
+  }, 5000);
+}
+
+function stopPageWatch() {
+  if (pageWatchTimer) {
+    clearInterval(pageWatchTimer);
+    pageWatchTimer = null;
+  }
 }
 
 function logService(msg) {
@@ -165,12 +199,17 @@ ipcMain.on('app:quit', () => {
 async function bootstrap() {
   apiKey = balance.resolveApiKey();
 
-  // 1. 确保服务运行（等就绪再加载页面）
-  const { started } = await harness.ensureHarnessRunning();
-  logService(started ? 'dsh web 服务已由本应用启动' : '复用已运行的 dsh web 服务');
-
-  // 2. 创建窗口
+  // 1. 立即创建窗口（秒开），页面由服务监听自动加载
   createMainWindow();
+  logService('窗口已打开，等待 dsh 服务...');
+
+  // 2. 异步确保服务运行（不阻塞窗口打开）
+  try {
+    const { started } = await harness.ensureHarnessRunning();
+    logService(started ? 'dsh web 服务已由本应用启动' : '复用已运行的 dsh web 服务');
+  } catch (err) {
+    logService(`服务启动异常: ${err.message}`);
+  }
 
   // 3. 启动余额轮询
   startBalancePolling();

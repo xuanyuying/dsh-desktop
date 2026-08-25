@@ -64,33 +64,33 @@ async function waitForHarness(timeoutMs = STARTUP_TIMEOUT_MS) {
 
 /**
  * 定位 dsh 入口：
- * 优先返回 { command: node.exe, script: dsh/bin.js }，
- * 其次 { command: 'dsh.cmd' }（走 PATH / npx 缓存）。
+ * 1) 全局 npm 安装（npm root -g 下的 @deepseek-ai/dsh）→ node + bin.js
+ * 2) npx 缓存 → node + bin.js
+ * 3) 回退 PATH / 显式 DSH_BIN 中的 dsh.cmd
  */
 function findDshEntry() {
-  // 1) 从 npx 缓存解析 @deepseek-ai/dsh 包，拿到 node + bin.js
+  // 1) 全局 npm 安装
+  const globalRoot = getGlobalNpmRoot();
+  if (globalRoot) {
+    const pkgDir = path.join(globalRoot, '@deepseek-ai', 'dsh');
+    const entry = resolvePackageEntry(pkgDir);
+    if (entry) return entry;
+  }
+
+  // 2) npx 缓存
   const npxRoot = path.join(process.env.LOCALAPPDATA || '', 'npm-cache', '_npx');
   try {
     const dirs = fs.readdirSync(npxRoot);
     for (const dir of dirs) {
       const pkgDir = path.join(npxRoot, dir, 'node_modules', '@deepseek-ai', 'dsh');
-      const pkgJson = path.join(pkgDir, 'package.json');
-      if (fs.existsSync(pkgJson)) {
-        const pkg = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
-        const bin = pkg.bin && (pkg.bin.dsh || pkg.bin['@deepseek-ai/dsh']);
-        if (bin) {
-          const script = path.join(pkgDir, bin);
-          if (fs.existsSync(script)) {
-            return { command: process.execPath, script };
-          }
-        }
-      }
+      const entry = resolvePackageEntry(pkgDir);
+      if (entry) return entry;
     }
   } catch {
     /* 忽略并回退 */
   }
 
-  // 2) 回退：PATH / 显式 DSH_BIN 中的 dsh.cmd
+  // 3) 回退：PATH / 显式 DSH_BIN 中的 dsh.cmd
   const explicit = process.env.DSH_BIN;
   if (explicit && fs.existsSync(explicit)) return { command: explicit };
   const pathDirs = (process.env.PATH || '').split(path.delimiter);
@@ -99,6 +99,52 @@ function findDshEntry() {
       const full = path.join(dir, name);
       if (fs.existsSync(full)) return { command: full };
     }
+  }
+  return null;
+}
+
+/** 获取全局 npm 包根目录 */
+function getGlobalNpmRoot() {
+  try {
+    // 优先 npm root -g（权威）
+    const { execFileSync } = require('node:child_process');
+    const out = execFileSync('npm', ['root', '-g'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+      timeout: 10000,
+    });
+    const root = out.trim();
+    if (root && fs.existsSync(root)) return root;
+  } catch {
+    /* 忽略 */
+  }
+  // 回退：Windows 常见全局位置
+  const candidates = [
+    path.join(process.env.APPDATA || '', 'npm', 'node_modules'),
+    path.join(process.env.LOCALAPPDATA || '', 'npm', 'node_modules'),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+/** 从包目录解析 node + bin.js 入口 */
+function resolvePackageEntry(pkgDir) {
+  const pkgJson = path.join(pkgDir, 'package.json');
+  if (!fs.existsSync(pkgJson)) return null;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
+    const bin = pkg.bin && (pkg.bin.dsh || pkg.bin['@deepseek-ai/dsh']);
+    if (bin) {
+      const script = path.join(pkgDir, bin);
+      if (fs.existsSync(script)) {
+        return { command: process.execPath, script };
+      }
+    }
+  } catch {
+    /* 忽略 */
   }
   return null;
 }
