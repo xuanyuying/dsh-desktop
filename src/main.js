@@ -136,9 +136,30 @@ function createMainWindow() {
 
   mainWindow.webContents.on('did-finish-load', () => {
     pageLoadRetry = 0;
-    pageReady = true;
-    stopPageWatch();
-    logService('connected ' + harness.HARNESS_URL);
+    // 延迟检查：页面 HTML 加载完成不代表 React 已渲染。
+    // 若 #root 无内容（React 未挂载），视为加载失败并重试。
+    setTimeout(async () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      try {
+        const len = await mainWindow.webContents.executeJavaScript(
+          'document.getElementById("root") ? document.getElementById("root").innerHTML.length : -1'
+        );
+        if (len > 0) {
+          pageReady = true;
+          stopPageWatch();
+          logService('UI rendered (#root len=' + len + ')');
+        } else {
+          logService('page loaded but #root empty (React not mounted), retrying...');
+          pageReady = false;
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.loadURL(harness.HARNESS_URL);
+          }
+        }
+      } catch (e) {
+        logService('render check error: ' + e.message);
+        pageReady = true; // 检查失败则视为已加载，避免死循环
+      }
+    }, 3000);
   });
 
   mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {

@@ -202,9 +202,10 @@ async function ensureHarnessRunning() {
 
 /** 尝试 spawn dsh web 并等待就绪 */
 async function trySpawnWeb(dshEntry) {
+  // --no-open：阻止 dsh web 自动打开系统浏览器（界面由 DSH Desktop 窗口承载）
   const args = dshEntry.script
-    ? [dshEntry.script, 'web', '--port', String(HARNESS_PORT)]
-    : ['web', '--port', String(HARNESS_PORT)];
+    ? [dshEntry.script, 'web', '--port', String(HARNESS_PORT), '--no-open']
+    : ['web', '--port', String(HARNESS_PORT), '--no-open'];
 
   return new Promise((resolve) => {
     let child = null;
