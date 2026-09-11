@@ -10,13 +10,55 @@
 
 ---
 
+## ✨ 功能特性
+
+### 🖥️ 桌面集成
+- **标准菜单栏**：文件 / 编辑 / 视图 / 工具 / 帮助 五段式菜单，符合 Windows 桌面软件习惯
+  - 文件：新建会话（Ctrl+N）、刷新界面（Ctrl+R）、在浏览器打开、打开配置目录、退出
+  - 编辑：撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选
+  - 视图：重新加载（F5）、强制重载、缩放、全屏（F11）、开发者工具（F12）
+  - 工具：**检查 dsh 更新**、重启 dsh 服务、查看服务状态
+  - 帮助：官方文档、项目主页、反馈问题、关于
+- **快捷键**：Ctrl+N 新建会话、F5 刷新、F11 全屏、F12 开发者工具
+
+### 🚀 自动启动前提
+启动时自动完成，无需手动执行任何命令：
+1. 定位 dsh 命令（全局 npm / npx 缓存 / PATH）
+2. 未安装时自动 `npm install -g @deepseek-ai/dsh`
+3. 自动启动 `dsh web`（带 `--no-open`，界面由窗口承载而非跳浏览器）
+4. 服务就绪后自动加载界面（含渲染检查与失败重试）
+
+### 🔄 版本管理
+- 菜单「工具 → 检查 dsh 更新」：对比本地与 npm 最新版本，**一键升级** dsh
+- 升级后提示重启服务以生效
+
+### 💰 余额显示
+- 右下角实时显示账户余额（30 秒刷新，点击手动刷新，悬停看明细）
+
+### 🔌 DeepSeek Harness 0.1.5+ 适配
+- **认证机制适配（关键）**：0.1.5 起 `dsh web` 需要认证，裸访问返回 401。本应用会捕获启动输出中的**带 token URL** 并用它加载界面（303 → cookie → 200），彻底解决黑屏
+- **端口冲突自愈**：若 3080 被无法认证的遗留服务占用，自动清理该 dsh web 进程并重启自己的服务
+- **代理支持**：传递 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` 环境变量（0.1.5 新增）
+- 兼容 `--no-open` 官方参数（0.1.5 官方推荐用法）
+- 支持 0.1.5 新特性：DeepSeek-V41-Flash 模型、任意文件上传、右侧 Sidebar 预览
+
+### 🩺 诊断工具
+
+遇到启动问题时运行（输出环境、服务、认证、余额、代理状态）：
+
+```powershell
+node scripts\doctor.js
+```
+
+---
+
 ## 📸 运行截图
 
 ![DSH Desktop 运行截图](docs/screenshot.png)
 
 ## ⬇️ 下载安装
 
-前往 [Releases 页面](https://github.com/xuanyuying/dsh-desktop/releases) 下载 **`DSH Desktop Setup 1.0.0.exe`** 安装程序（Windows 10/11，约 95 MB）。
+前往 [Releases 页面](https://github.com/xuanyuying/dsh-desktop/releases) 下载 **`DSH Desktop Setup 1.2.1.exe`** 安装程序（Windows 10/11，约 95 MB）。
 
 或克隆源码自行构建：
 
@@ -122,7 +164,7 @@ node scripts\build-dist.js
 2. 解压工具到本地缓存（幂等，二次打包秒过）
 3. 自动 patch electron-builder 适配受限环境
 4. 使用本地已解压的 Electron（`electronDist`），全程离线
-5. 产出 `dist\DSH Desktop Setup 1.0.0.exe`
+5. 产出 `dist\DSH Desktop Setup 1.2.1.exe`
 
 ---
 
@@ -131,16 +173,17 @@ node scripts\build-dist.js
 ```
 dsh-desktop-desk/
 ├── src/
-│   ├── main.js            # 主进程：Electron 集成（窗口、IPC、生命周期）
+│   ├── main.js            # 主进程：Electron 集成（窗口、IPC、菜单、生命周期）
+│   ├── menu.js            # 应用菜单栏（文件/编辑/视图/工具/帮助）
 │   ├── preload.js         # 预加载：右下角余额浮层 UI + IPC 桥
 │   └── lib/
-│       ├── harness.js     # Harness 服务检测/启动/停止（纯 Node 模块）
+│       ├── harness.js     # Harness 服务检测/启动/停止 + 版本检测升级（纯 Node）
 │       └── balance.js     # DeepSeek 余额 API 查询（纯 Node 模块，通用 Key 解析）
 ├── scripts/
 │   ├── build-dist.js          # 一键打包（国内镜像 / 离线）
 │   ├── prepare-builder-cache.js  # 构建工具缓存准备
 │   ├── download-builder-tools.js # 构建工具下载（npmmirror）
-│   ├── smoke-test.js / test-lib.js / test-preload.js  # 测试
+│   ├── smoke-test.js / test-lib.js / test-preload.js / test-menu.js  # 测试
 │   └── gen-ico.js / download-electron.js / extract-electron.js / patch-builder.js
 ├── build/                 # 应用图标
 ├── config.example.json    # API Key 配置模板（通用）
