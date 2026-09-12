@@ -107,6 +107,10 @@ function setupMenu(handlers) {
           click: () => handlers.showStatus(),
         },
         {
+          label: '打开日志文件',
+          click: () => handlers.openLogFile(),
+        },
+        {
           label: '打开服务日志',
           click: () => handlers.showServiceLog(),
         },

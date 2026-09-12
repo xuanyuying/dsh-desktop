@@ -9,10 +9,37 @@
 
 const { app, BrowserWindow, ipcMain, shell, dialog, session } = require('electron');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 
 const harness = require('./lib/harness');
 const balance = require('./lib/balance');
 const { setupMenu } = require('./menu');
+
+// ---------------------------------------------------------------------------
+// File logging（便于诊断 GUI 问题：渲染错误、认证、WebSocket）
+// ---------------------------------------------------------------------------
+const LOG_DIR = path.join(os.homedir(), '.dsh-desktop');
+const LOG_FILE = path.join(LOG_DIR, 'desktop.log');
+
+function logToFile(line) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    try {
+      const st = fs.statSync(LOG_FILE);
+      if (st.size > 2 * 1024 * 1024) fs.writeFileSync(LOG_FILE, '');
+    } catch {
+      /* 文件不存在 */
+    }
+    fs.appendFileSync(LOG_FILE, '[' + new Date().toISOString() + '] ' + String(line) + '\n');
+  } catch {
+    /* 忽略日志写入失败 */
+  }
+}
+
+function getLogFilePath() {
+  return LOG_FILE;
+}
 
 const BALANCE_REFRESH_MS = 30 * 1000; // 30s balance refresh
 const PAGE_LOAD_RETRY_MS = 3000;      // page reload retry interval
@@ -136,6 +163,49 @@ function createMainWindow() {
     return { action: 'deny' };
   });
 
+  // 捕获渲染进程 console（React/WebSocket/fetch 错误都在这里），写入日志文件
+  mainWindow.webContents.on('console-message', (...args) => {
+    try {
+      let level, message, sourceId, lineNumber;
+      // Electron 新版：(details)；旧版：(event, level, message, line, sourceId)
+      if (args.length === 1 && args[0] && typeof args[0] === 'object' && 'message' in args[0]) {
+        const d = args[0];
+        level = d.level;
+        message = d.message;
+        sourceId = d.sourceId;
+        lineNumber = d.lineNumber;
+      } else {
+        level = args[1];
+        message = args[2];
+        lineNumber = args[3];
+        sourceId = args[4];
+      }
+      const levelNames = ['verbose', 'info', 'warning', 'error'];
+      const lv = typeof level === 'number' ? levelNames[level] || level : level;
+      // 只记录 warning/error，避免日志过载
+      if (lv === 'warning' || lv === 'error') {
+        logToFile('renderer[' + lv + '] ' + String(message).slice(0, 1500) + ' @ ' + String(sourceId || '').slice(-60) + ':' + lineNumber);
+      }
+    } catch {
+      /* 忽略 */
+    }
+  });
+
+  // 渲染进程崩溃
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    logToFile('render-process-gone: ' + JSON.stringify(details));
+    logService('render process gone: ' + (details && details.reason));
+  });
+
+  // 页面导航/重定向日志（诊断认证 303 流程）
+  mainWindow.webContents.on('did-navigate', (_e, url, httpCode) => {
+    logToFile('navigate: ' + String(url).replace(/token=[^&]+/, 'token=***') + (httpCode ? ' (http ' + httpCode + ')' : ''));
+  });
+  mainWindow.webContents.on('did-redirect-navigation', (_e, url, isInPlace, isMainFrame, frameProcessId, frameRoutingId) => {
+    // 认证 303 重定向
+    logToFile('redirect to: ' + String(url).replace(/token=[^&]+/, 'token=***'));
+  });
+
   mainWindow.webContents.on('did-finish-load', () => {
     // 启动提示页（data:）不做渲染检查
     const curUrl = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.getURL() : '';
@@ -149,13 +219,36 @@ function createMainWindow() {
       const url2 = mainWindow.webContents.getURL();
       if (url2.startsWith('data:')) return;
       try {
-        const len = await mainWindow.webContents.executeJavaScript(
-          'document.getElementById("root") ? document.getElementById("root").innerHTML.length : -1'
-        );
+        // 收集渲染诊断信息（写入日志，便于排查空白/交互失效）
+        const info = await mainWindow.webContents.executeJavaScript(`(function () {
+          try {
+            var root = document.getElementById('root');
+            var body = document.body;
+            return JSON.stringify({
+              rootLen: root ? root.innerHTML.length : -1,
+              title: document.title || '',
+              url: location.href.replace(/token=[^&]+/, 'token=***'),
+              bodyText: body ? (body.innerText || '').replace(/\\s+/g, ' ').slice(0, 160) : '',
+              hasSidebar: !!document.querySelector('[class*="sidebar" i], [class*="Sidebar"]'),
+              hasComposer: !!document.querySelector('textarea, [contenteditable="true"]'),
+              errText: body && /error|failed|401|unauthor/i.test(body.innerText || '') ? (body.innerText || '').slice(0, 160) : ''
+            });
+          } catch (e) { return JSON.stringify({ err: String(e && e.message) }); }
+        })()`);
+        logToFile('render info: ' + info);
+
+        let parsed = {};
+        try {
+          parsed = JSON.parse(info);
+        } catch {
+          /* 忽略 */
+        }
+        const len = typeof parsed.rootLen === 'number' ? parsed.rootLen : -1;
+
         if (len > 0) {
           pageReady = true;
           stopPageWatch();
-          logService('UI rendered (#root len=' + len + ')');
+          logService('UI rendered (root=' + len + ', sidebar=' + !!parsed.hasSidebar + ', composer=' + !!parsed.hasComposer + ')');
         } else {
           logService('page loaded but #root empty (React not mounted), retrying...');
           pageReady = false;
@@ -225,17 +318,64 @@ function loadLoadingPage() {
 // Menu handlers
 // ---------------------------------------------------------------------------
 
-function menuNewSession() {
+/**
+ * 新建会话：真正点击 Harness 侧边栏的"新建会话"按钮。
+ * 该按钮：button[aria-label="新建会话"|"New session"]（class 含 newSession），
+ * 点击后调用前端 startSession() 创建工作区会话。
+ * 找不到按钮时兜底重载界面。
+ */
+async function menuNewSession() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  // 通过 Harness 前端的新会话入口：重新载入界面（Harness 会回到会话列表）
-  mainWindow.loadURL(harness.getLoadUrl());
-  logService('new session: reloading UI');
+  try {
+    const hit = await mainWindow.webContents.executeJavaScript(`(function () {
+      var selectors = [
+        'button[aria-label="新建会话"]',
+        'button[aria-label="New session"]',
+        'button[aria-label="New Session"]',
+        '[class*="newSession"]',
+        '[class*="_newSession"]'
+      ];
+      for (var i = 0; i < selectors.length; i++) {
+        var el = document.querySelector(selectors[i]);
+        if (el) {
+          el.click();
+          return selectors[i];
+        }
+      }
+      return null;
+    })()`);
+
+    if (hit) {
+      logService('new session: clicked "' + hit + '"');
+      return;
+    }
+    // 兜底：可能仍停留在启动页/401，重新加载界面
+    logService('new session button not found, reloading UI');
+    await reloadUI();
+  } catch (e) {
+    logService('new session failed: ' + e.message);
+    try {
+      await reloadUI();
+    } catch {
+      /* 忽略 */
+    }
+  }
 }
 
-function menuRefreshPage() {
+/**
+ * 统一重载：已认证（有 dsh-auth cookie）时用裸 URL，
+ * 否则用带 token 的 URL（token 可重复使用）。
+ */
+async function reloadUI() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  const authed = await hasAuthCookie();
+  const target = authed ? harness.HARNESS_URL + '/' : harness.getLoadUrl();
   pageReady = false;
-  mainWindow.loadURL(harness.getLoadUrl());
+  mainWindow.loadURL(target);
+}
+
+async function menuRefreshPage() {
+  await reloadUI();
 }
 
 function menuForceReload() {
@@ -398,6 +538,25 @@ function menuOpenInBrowser() {
   shell.openExternal(harness.HARNESS_URL);
 }
 
+/** 打开日志文件（或所在目录） */
+function menuOpenLogFile() {
+  const file = getLogFilePath();
+  if (fs.existsSync(file)) {
+    shell.openPath(file).then((err) => {
+      if (err && mainWindow && !mainWindow.isDestroyed()) {
+        dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          title: '打开日志失败',
+          message: err,
+          detail: '日志路径：' + file,
+        });
+      }
+    });
+  } else {
+    shell.openPath(LOG_DIR);
+  }
+}
+
 /** 关于对话框 */
 function menuShowAbout() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -436,6 +595,7 @@ function initMenu() {
     showServiceLog: menuShowServiceLog,
     openConfigDir: menuOpenConfigDir,
     openInBrowser: menuOpenInBrowser,
+    openLogFile: menuOpenLogFile,
     showAbout: menuShowAbout,
   });
 }
@@ -508,6 +668,7 @@ function logService(msg) {
     mainWindow.webContents.send('service:log', line);
   }
   safeLog(line);
+  logToFile(line);
 }
 
 // ---------------------------------------------------------------------------
