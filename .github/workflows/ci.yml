@@ -51,7 +51,20 @@ jobs:
           Write-Host "语法检查通过"
 
       - name: 运行测试
-        run: npm test
+        shell: pwsh
+        run: |
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 需要本机安装 dsh 的一组测试。它们使用临时 DSH_HOME 与随机端口，
+      # 不会碰任何既有服务；装进 CI 以换取真实的启动/认证/端口退让覆盖。
+      - name: 安装 dsh 并运行 harness 测试
+        shell: pwsh
+        run: |
+          npm install -g @deepseek-ai/dsh --no-fund --no-audit
+          dsh --version
+          npm run test:harness
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 校验打包配置引用的资源都存在
         shell: pwsh

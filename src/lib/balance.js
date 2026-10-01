@@ -41,24 +41,18 @@ function configFilePath() {
   return path.join(os.homedir(), '.dsh-desktop', 'config.json');
 }
 
+/** 配置文件里允许出现的字段（说明文字放 README/docs，不写进 JSON） */
+const CONFIG_KEYS = ['apiKey', 'apiKeyEncrypted'];
+
 /** 首次运行时创建配置文件（此前只能靠用户照报错手搓） */
 function ensureConfigFile() {
   const file = configFilePath();
   if (fs.existsSync(file)) return { created: false, path: file };
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(
-      file,
-      JSON.stringify(
-        {
-          apiKey: '',
-          _说明: '填写你的 DeepSeek API Key（https://platform.deepseek.com 获取）。也可用设置面板保存，那样会以系统加密方式存储。',
-        },
-        null,
-        2
-      ),
-      'utf8'
-    );
+    // 只写真实字段：JSON 没有注释，带 `_` 前缀的"说明字段"会被当成真实配置，
+    // 既可能被下游误读，也让"这个文件里允许有什么"变得含糊。
+    fs.writeFileSync(file, JSON.stringify({ apiKey: '' }, null, 2), 'utf8');
     return { created: true, path: file };
   } catch (e) {
     return { created: false, path: file, error: e.message };
@@ -227,6 +221,7 @@ async function getBalanceData(apiKey) {
 
 module.exports = {
   BALANCE_API,
+  CONFIG_KEYS,
   resolveApiKey,
   fetchBalance,
   getBalanceData,

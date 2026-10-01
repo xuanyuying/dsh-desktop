@@ -64,6 +64,60 @@ function getLogFilePath() {
   return LOG_FILE;
 }
 
+const STARTUP_LOG = path.join(LOG_DIR, 'startup.log');
+
+/**
+ * 记录每一次进程启动，包括「抢锁失败、立即退出」的那种。
+ *
+ * 起因：安装瞬间日志里出现了 12 组几乎相同的启动痕迹，但最终只有 1 个实例存活。
+ * 光看 desktop.log 无法区分「应用自己重启」和「被外部连点/被脚本拉起 N 次」，
+ * 所以把 pid / 父进程 pid / 是否拿到锁 都单独落一份，并统计 5 秒内的启动次数。
+ */
+function logStartup(gotLock) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+
+    let recent = [];
+    try {
+      recent = fs.readFileSync(STARTUP_LOG, 'utf8').split('\n').filter(Boolean);
+    } catch {
+      /* 首次运行 */
+    }
+
+    const now = Date.now();
+    const stamps = recent
+      .slice(-40)
+      .map((l) => Number((l.match(/ts=(\d+)/) || [])[1]))
+      .filter((n) => Number.isFinite(n));
+    const burst = stamps.filter((t) => now - t < 5000).length + 1;
+
+    const line =
+      '[' + new Date().toISOString() + ']' +
+      ' ts=' + now +
+      ' pid=' + process.pid +
+      ' ppid=' + (process.ppid || 0) +
+      ' lock=' + gotLock +
+      ' burst5s=' + burst +
+      ' ver=' + app.getVersion() +
+      ' argv=' + JSON.stringify(process.argv.slice(1)) +
+      ' exe=' + process.execPath +
+      '\n';
+
+    // 只保留最近 200 行，避免无限增长
+    const kept = recent.slice(-199).join('\n');
+    fs.writeFileSync(STARTUP_LOG, (kept ? kept + '\n' : '') + line, 'utf8');
+
+    if (burst >= 3) {
+      logToFile(
+        '[startup] 启动风暴：5 秒内第 ' + burst + ' 次启动' +
+          '（pid=' + process.pid + ' ppid=' + process.ppid + ' lock=' + gotLock + '）'
+      );
+    }
+  } catch {
+    /* 诊断失败不影响启动 */
+  }
+}
+
 const BALANCE_REFRESH_MS = 30 * 1000; // 30s balance refresh
 const PAGE_LOAD_RETRY_MS = 3000;      // page reload retry interval
 const PAGE_LOAD_MAX_RETRY = 5;        // max retry count
@@ -105,11 +159,19 @@ try {
 
 // ---------------------------------------------------------------------------
 // Single instance lock
+//
+// 抢锁失败必须**立刻终止**，不能只调 app.quit()：quit 是异步的，后面的
+// app.whenReady() 仍会触发，于是"失败者"也会跑一遍 bootstrap —— 建托盘、
+// 建窗口、甚至再起一个 dsh web，日志里留下一串重复记录。
+// 实测安装瞬间有 12 个实例同时启动，其中 11 个都留下了这种假启动痕迹。
+// 因此这里改用 app.exit(0)（立即结束），并在拿到锁之前不注册任何启动逻辑。
 // ---------------------------------------------------------------------------
 const gotLock = app.requestSingleInstanceLock();
+logStartup(gotLock);
+
 if (!gotLock) {
-  safeLog('[dsh-desktop] existing instance running, quit duplicate');
-  app.quit();
+  safeLog('[dsh-desktop] existing instance running, exit duplicate immediately');
+  app.exit(0);
 } else {
   app.on('second-instance', () => {
     if (mainWindow) {
@@ -144,9 +206,19 @@ async function refreshBalance() {
   pushBalance(data);
 }
 
+/** 最近一次余额数据（菜单栏最右端的「余额」用它渲染） */
+let lastBalanceData = null;
+
 function pushBalance(data) {
+  lastBalanceData = data;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('balance:update', data);
+  }
+  // 菜单栏最右端同时显示余额，需要一并刷新
+  try {
+    pushPeak();
+  } catch {
+    /* 忽略 */
   }
 }
 
@@ -223,7 +295,38 @@ function buildPeakPayload() {
     harnessRunning: harness.startedByUs ? 'self' : 'external',
   });
   guardAlive = payload.guardAlive;
-  return { ...payload, guardInjected };
+  return {
+    ...payload,
+    guardInjected,
+    // 菜单栏最右端要显示余额，随状态一起下发
+    balance: lastBalanceData,
+    floatHud: isFloatHud(),
+  };
+}
+
+/** 是否在页面上渲染浮动小卡（默认关闭） */
+function isFloatHud() {
+  try {
+    return uiState.loadHud().enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+/** 开关浮动小卡 */
+function setFloatHud(enabled) {
+  const cur = uiState.loadHud();
+  uiState.saveHud({ ...cur, enabled: !!enabled });
+  logService('floatHud=' + !!enabled);
+  pushPeak();
+  return !!enabled;
+}
+
+/** 菜单「刷新」：立刻重取余额与时段 */
+function refreshPeakNow() {
+  refreshBalance().catch(() => {});
+  pushPeak();
+  return true;
 }
 
 function pushPeak() {
@@ -837,6 +940,13 @@ function menuOpenLogFile() {
 }
 
 /** 关于对话框 */
+/**
+ * 关于对话框。
+ *
+ * 这里故意**只放一个「确定」按钮**：之前它带了一个「打开项目主页」按钮，
+ * 但 Windows 上关闭对话框（点 X 或按 Esc）的返回值会落到第二个按钮上，
+ * 导致"关掉关于窗口就自动跳转网页"。需要打开主页时走菜单里的独立项。
+ */
 function menuShowAbout() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const local = harness.getLocalDshVersion();
@@ -846,18 +956,15 @@ function menuShowAbout() {
     message: 'DSH Desktop v' + app.getVersion(),
     detail:
       'DeepSeek Harness 桌面版\n\n' +
-      '内嵌完整 Harness Web 界面，右下角实时显示账户余额。\n\n' +
+      '内嵌完整 Harness Web 界面，右上角实时显示峰谷时段与账户余额。\n\n' +
       'dsh 版本：' + (local || '未知') +
       '\n服务地址：' + harness.HARNESS_URL +
       '\nElectron：' + process.versions.electron +
       '\nChromium：' + process.versions.chrome +
       '\n\n项目主页：https://github.com/xuanyuying/dsh-desktop',
-    buttons: ['确定', '打开项目主页'],
+    buttons: ['确定'],
     defaultId: 0,
-  }).then((r) => {
-    if (r.response === 1) {
-      shell.openExternal('https://github.com/xuanyuying/dsh-desktop');
-    }
+    noLink: true,
   });
 }
 
@@ -881,6 +988,8 @@ function initMenu() {
     setPeakGuard,
     allowPeakTemporarily,
     getPeakPayload: buildPeakPayload,
+    setFloatHud,
+    refreshPeakNow,
     checkDesktopUpdate,
     openSettings: openSettingsWindow,
     openLogs: openLogsWindow,
@@ -1469,12 +1578,14 @@ async function headlessTest() {
   app.exit(0);
 }
 
-if (process.argv.includes('--headless-test')) {
+// 双保险：抢锁失败时即使 app.exit(0) 尚未生效，也绝不进入启动流程。
+// （只调 app.quit() 时 whenReady 仍会触发，失败者会照样建窗口、起服务。）
+if (gotLock && process.argv.includes('--headless-test')) {
   app.whenReady().then(() => headlessTest().catch((err) => {
     safeLog('headless test failed: ' + err.message);
     app.exit(1);
   }));
-} else {
+} else if (gotLock) {
   app.whenReady().then(async () => {
     try {
       await bootstrap();

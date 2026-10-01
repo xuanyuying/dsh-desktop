@@ -98,32 +98,55 @@ check('损坏的 JSON → 回落为空对象', () => {
   assert.deepStrictEqual(ui.loadState(), {});
 });
 
-console.log('\n[3] HUD 位置');
-check('默认位置为右上 12/12、未折叠', () => {
+console.log('\n[3] HUD 位置与开关');
+check('默认：开启、吸附、未折叠、无手动坐标', () => {
   fs.rmSync(SANDBOX, { recursive: true, force: true });
-  assert.deepStrictEqual(ui.loadHud(), { right: 12, top: 12, collapsed: false });
+  assert.deepStrictEqual(ui.loadHud(), {
+    left: null,
+    top: null,
+    collapsed: false,
+    enabled: true,
+    anchored: true,
+  });
 });
 check('保存后能读回（跨端口不变，这是改用文件的核心目的）', () => {
-  ui.saveHud({ right: 300, top: 480, collapsed: true });
+  ui.saveHud({ left: 300, top: 480, collapsed: true, enabled: true, anchored: false });
   const h = ui.loadHud();
-  assert.strictEqual(h.right, 300);
+  assert.strictEqual(h.left, 300);
   assert.strictEqual(h.top, 480);
   assert.strictEqual(h.collapsed, true);
+  assert.strictEqual(h.enabled, true, '悬浮小卡开关未持久化');
+  assert.strictEqual(h.anchored, false, '拖动后应记住已解除吸附');
+});
+check('enabled 只有显式 false 才关闭（默认开启）', () => {
+  assert.strictEqual(ui.normalizeHud({}).enabled, true);
+  assert.strictEqual(ui.normalizeHud({ enabled: false }).enabled, false);
+  assert.strictEqual(ui.normalizeHud({ enabled: true }).enabled, true);
+});
+check('anchored 只有显式 false 才解除（默认吸附）', () => {
+  assert.strictEqual(ui.normalizeHud({}).anchored, true);
+  assert.strictEqual(ui.normalizeHud({ anchored: false }).anchored, false);
+});
+check('旧版本结构（只有 right/top）升级后小卡仍显示', () => {
+  const migrated = ui.normalizeHud({ right: 12, top: 12, collapsed: false });
+  assert.strictEqual(migrated.enabled, true, '旧结构应迁移为默认开启');
+  assert.strictEqual(migrated.anchored, true);
+  assert.strictEqual(migrated.left, null);
 });
 check('非法值被归一化', () => {
-  const h = ui.normalizeHud({ right: 'abc', top: NaN, collapsed: 'yes' });
-  assert.strictEqual(h.right, 12);
-  assert.strictEqual(h.top, 12);
+  const h = ui.normalizeHud({ left: 'abc', top: NaN, collapsed: 'yes' });
+  assert.strictEqual(h.left, null);
+  assert.strictEqual(h.top, null);
   assert.strictEqual(h.collapsed, false);
 });
-check('超大坐标被夹到合理上限', () => {
-  const h = ui.normalizeHud({ right: 999999, top: -50 });
-  assert.ok(h.right <= 4000, 'right=' + h.right);
-  assert.ok(h.top >= 0, 'top=' + h.top);
+check('超大坐标被夹到合理上限、负值被夹到 0', () => {
+  const h = ui.normalizeHud({ left: 999999, top: -50 });
+  assert.ok(h.left <= 8000, 'left=' + h.left);
+  assert.strictEqual(h.top, 0, 'top=' + h.top);
 });
 check('saveHud 不影响 window 段', () => {
   ui.saveState({ window: { x: 7, y: 8, width: 900, height: 700 } });
-  ui.saveHud({ right: 5, top: 6, collapsed: false });
+  ui.saveHud({ left: 5, top: 6, collapsed: false });
   assert.strictEqual(ui.loadState().window.x, 7, 'window 段被 HUD 覆盖了');
 });
 

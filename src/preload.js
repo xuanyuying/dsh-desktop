@@ -20,7 +20,6 @@ const { contextBridge, ipcRenderer } = require('electron');
 // 通用工具
 // ---------------------------------------------------------------------------
 
-const DEFAULT_POS = { right: 12, top: 12 };
 const POS_KEY = 'dshDesktop.hudPos';
 const COLLAPSE_KEY = 'dshDesktop.hudCollapsed';
 const IDLE_OPACITY = '0.45';
@@ -70,10 +69,12 @@ function loadHudState() {
     if (s && typeof s === 'object') {
       return {
         pos: {
-          right: Number.isFinite(s.right) ? s.right : DEFAULT_POS.right,
-          top: Number.isFinite(s.top) ? s.top : DEFAULT_POS.top,
+          left: Number.isFinite(s.left) ? s.left : null,
+          top: Number.isFinite(s.top) ? s.top : null,
         },
         collapsed: s.collapsed === true,
+        enabled: s.enabled !== false,
+        anchored: s.anchored !== false,
       };
     }
   } catch {
@@ -81,14 +82,24 @@ function loadHudState() {
   }
   const pos = loadJSON(POS_KEY, null);
   return {
-    pos: pos && Number.isFinite(pos.right) && Number.isFinite(pos.top) ? pos : { ...DEFAULT_POS },
+    pos: {
+      left: pos && Number.isFinite(pos.left) ? pos.left : null,
+      top: pos && Number.isFinite(pos.top) ? pos.top : null,
+    },
     collapsed: loadJSON(COLLAPSE_KEY, false) === true,
+    enabled: true,
+    anchored: true,
   };
 }
 
 /** 持久化 HUD 状态（主进程 + localStorage 兜底） */
 function persistHud() {
-  const payload = { right: hudPos.right, top: hudPos.top, collapsed: hudCollapsed };
+  const payload = {
+    left: hudPos.left,
+    top: hudPos.top,
+    collapsed: hudCollapsed,
+    anchored: hudAnchored,
+  };
   try {
     ipcRenderer.invoke('ui:set-hud', payload);
   } catch {
@@ -145,8 +156,16 @@ const TOAST_ID = 'dsh-desktop-peak-toast';
 let balanceState = null;
 let peakState = null;
 const initialHud = loadHudState();
+/** 手动坐标（仅在 hudAnchored 为 false 时生效） */
 let hudPos = initialHud.pos;
 let hudCollapsed = initialHud.collapsed;
+/** 是否吸附在「XX模式」徽标右侧（默认是） */
+let hudAnchored = initialHud.anchored;
+
+/** 找不到「XX模式」徽标时的兜底位置 */
+const FALLBACK_POS = { right: 12, top: 12 };
+/** 徽标文字：以「模式」结尾的短标签（创造模式 / 标准模式 / …） */
+const MODE_BADGE_RE = /模式$/;
 
 function el(id) {
   return document.getElementById(id);
@@ -159,16 +178,93 @@ function setRow(id, text, icon) {
   if (i) i.textContent = icon;
 }
 
+/**
+ * 找到会话标题旁的「XX模式」徽标。
+ *
+ * 该徽标通常**自带一个图标子节点**，所以不能用「无子元素」来筛 ——
+ * 那样会把真正的徽标排除掉，导致小卡落到兜底位置（右上角）挡住侧边栏按钮。
+ * 改用尺寸约束（小标签）排除整块容器。
+ * @returns {{el:Element, rect:DOMRect}|null}
+ */
+function findModeBadge() {
+  let nodes;
+  try {
+    nodes = document.querySelectorAll('span, div, button, a');
+  } catch {
+    return null;
+  }
+  let best = null;
+  for (const node of nodes) {
+    if (!node) continue;
+    // 不要选中自己的浮层
+    if (node.id && String(node.id).indexOf(HUD_ID) === 0) continue;
+    const text = (node.textContent || '').trim();
+    if (!text || text.length > 8) continue;
+    if (!MODE_BADGE_RE.test(text)) continue;
+    let rect;
+    try {
+      rect = node.getBoundingClientRect();
+    } catch {
+      continue;
+    }
+    if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+    // 尺寸约束：徽标是个小标签，不是整块区域
+    if (rect.width > 240 || rect.height > 40) continue;
+    if (rect.top < 0 || rect.top > window.innerHeight * 0.4) continue;
+    // 取最靠上、同一行里最靠左的那个（标题行里的徽标）
+    if (
+      !best ||
+      rect.top < best.rect.top - 2 ||
+      (Math.abs(rect.top - best.rect.top) <= 2 && rect.left < best.rect.left)
+    ) {
+      best = { el: node, rect };
+    }
+  }
+  return best;
+}
+
+/**
+ * 吸附位置：徽标右边缘再往右「2 个字符」。
+ * 字符宽度按徽标自身的字号估算（CJK 字符宽度≈1em）。
+ * @returns {{left:number, top:number}|null}
+ */
+function anchorPosition() {
+  const badge = findModeBadge();
+  if (!badge) return null;
+  const rect = badge.rect;
+  let fontSize = 12;
+  try {
+    const fs = parseFloat(window.getComputedStyle(badge.el).fontSize);
+    if (Number.isFinite(fs) && fs > 0) fontSize = fs;
+  } catch {
+    /* 用默认值 */
+  }
+  const gap = 2 * fontSize;
+  return { left: Math.round(rect.right + gap), top: Math.round(rect.top) };
+}
+
 /** 应用位置与折叠状态 */
 function applyHudLayout() {
   const hud = el(HUD_ID);
   if (!hud) return;
-  const right = Number(hudPos.right);
-  const top = Number(hudPos.top);
-  hud.style.right = (Number.isFinite(right) ? right : DEFAULT_POS.right) + 'px';
-  hud.style.top = (Number.isFinite(top) ? top : DEFAULT_POS.top) + 'px';
-  hud.style.left = 'auto';
+
+  const anchor = hudAnchored ? anchorPosition() : null;
+  if (anchor) {
+    hud.style.left = anchor.left + 'px';
+    hud.style.top = anchor.top + 'px';
+    hud.style.right = 'auto';
+  } else if (!hudAnchored && Number.isFinite(hudPos.left) && Number.isFinite(hudPos.top)) {
+    hud.style.left = hudPos.left + 'px';
+    hud.style.top = hudPos.top + 'px';
+    hud.style.right = 'auto';
+  } else {
+    // 吸附模式但没找到徽标（页面还没渲染完 / UI 变了）→ 退回右上角
+    hud.style.right = FALLBACK_POS.right + 'px';
+    hud.style.top = FALLBACK_POS.top + 'px';
+    hud.style.left = 'auto';
+  }
   hud.style.bottom = 'auto';
+
   const body = el(HUD_ID + '-body');
   if (body) body.style.display = hudCollapsed ? 'none' : 'block';
   const toggle = el(HUD_ID + '-toggle');
@@ -200,16 +296,21 @@ function ensureHud() {
       'font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif',
       'font-size: 12px',
       'line-height: 1.5',
-      'cursor: grab',
       'user-select: none',
       'opacity: ' + IDLE_OPACITY,
       'transition: opacity 0.18s ease',
-      'max-width: 260px',
+      // 关键：整块浮层点击穿透，只有左侧手柄与折叠按钮可交互。
+      // 这样即使它恰好压在侧边栏按钮上，也不会抢走点击。
+      'pointer-events: none',
     ].join(';')
   );
 
   hud.innerHTML =
     '<div style="display:flex;align-items:flex-start;gap:6px">' +
+    '<span id="' +
+    HUD_ID +
+    '-handle" title="拖动移动 / 悬停看详情" ' +
+    'style="cursor:grab;pointer-events:auto;color:#8b949e;padding:0 2px;line-height:1.2">⠿</span>' +
     '<div id="' + HUD_ID + '-body" style="flex:1;min-width:0">' +
     '<div style="display:flex;align-items:center;gap:6px;white-space:nowrap">' +
     '<span id="' + HUD_ID + '-peak-text-icon">🟢</span>' +
@@ -220,7 +321,9 @@ function ensureHud() {
     '<span id="' + HUD_ID + '-bal-text">余额加载中…</span>' +
     '</div>' +
     '</div>' +
-    '<span id="' + HUD_ID + '-toggle" style="cursor:pointer;padding:0 2px;color:#8b949e">−</span>' +
+    '<span id="' +
+    HUD_ID +
+    '-toggle" style="cursor:pointer;pointer-events:auto;padding:0 2px;color:#8b949e">−</span>' +
     '</div>';
 
   // 悬停详情
@@ -249,12 +352,15 @@ function ensureHud() {
   );
   hud.appendChild(tip);
 
-  hud.addEventListener('mouseenter', () => {
+  // 容器是点击穿透的（pointer-events:none），所以悬停/拖动都挂在手柄上
+  const handle = el(HUD_ID + '-handle');
+  const hoverTarget = handle || hud;
+  hoverTarget.addEventListener('mouseenter', () => {
     hud.style.opacity = '1';
     renderTooltip(tip);
     tip.style.display = 'block';
   });
-  hud.addEventListener('mouseleave', () => {
+  hoverTarget.addEventListener('mouseleave', () => {
     hud.style.opacity = IDLE_OPACITY;
     tip.style.display = 'none';
   });
@@ -270,6 +376,7 @@ function ensureHud() {
   });
 
   installDrag(hud);
+  installAnchorWatch();
 
   document.documentElement.appendChild(hud);
   applyHudLayout();
@@ -278,13 +385,15 @@ function ensureHud() {
 
 /**
  * 拖动：按住移动即改位置，松手持久化。
- * 以 right/top 存储，窗口缩放后仍贴住右上角一侧。
+ *
+ * 一旦手动拖动就**解除吸附**（hudAnchored = false），此后按手动坐标摆放；
+ * 双击可恢复吸附。
  */
 function installDrag(hud) {
   let dragging = false;
   let startX = 0;
   let startY = 0;
-  let startRight = 0;
+  let startLeft = 0;
   let startTop = 0;
   let moved = false;
 
@@ -293,10 +402,13 @@ function installDrag(hud) {
     const dx = e.clientX - startX;
     const dy = e.clientY - startY;
     if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
-    const maxRight = Math.max(0, window.innerWidth - 60);
+    if (!moved) return;
+    // 第一次真实移动即脱离吸附
+    hudAnchored = false;
+    const maxLeft = Math.max(0, window.innerWidth - 60);
     const maxTop = Math.max(0, window.innerHeight - 40);
     hudPos = {
-      right: Math.min(maxRight, Math.max(0, startRight - dx)),
+      left: Math.min(maxLeft, Math.max(0, startLeft + dx)),
       top: Math.min(maxTop, Math.max(0, startTop + dy)),
     };
     applyHudLayout();
@@ -305,11 +417,17 @@ function installDrag(hud) {
   const onUp = () => {
     if (!dragging) return;
     dragging = false;
-    hud.style.cursor = 'grab';
+    try {
+      (el(HUD_ID + '-handle') || hud).style.cursor = 'grab';
+    } catch {
+      /* 忽略 */
+    }
     if (moved) persistHud();
   };
 
-  hud.addEventListener('mousedown', (e) => {
+  // 拖动挂在手柄上；容器本身点击穿透，不会抢走页面里的点击
+  const dragTarget = el(HUD_ID + '-handle') || hud;
+  dragTarget.addEventListener('mousedown', (e) => {
     const t = e && e.target;
     if (t && t.id === HUD_ID + '-toggle') return; // 折叠按钮不触发拖动
     if (e.button !== 0) return;
@@ -317,20 +435,48 @@ function installDrag(hud) {
     moved = false;
     startX = e.clientX;
     startY = e.clientY;
-    startRight = Number(hudPos.right) || DEFAULT_POS.right;
-    startTop = Number(hudPos.top) || DEFAULT_POS.top;
-    hud.style.cursor = 'grabbing';
+    // 起点取当前实际位置，吸附与手动两种模式都能平滑接续
+    let rect = null;
+    try {
+      rect = hud.getBoundingClientRect();
+    } catch {
+      /* 忽略 */
+    }
+    startLeft = rect ? rect.left : Number(hudPos.left) || 0;
+    startTop = rect ? rect.top : Number(hudPos.top) || FALLBACK_POS.top;
+    dragTarget.style.cursor = 'grabbing';
     if (e.preventDefault) e.preventDefault();
   });
 
-  hud.addEventListener('dblclick', () => {
-    hudPos = Object.assign({}, DEFAULT_POS);
+  // 双击恢复吸附到「XX模式」右侧
+  dragTarget.addEventListener('dblclick', () => {
+    hudAnchored = true;
+    hudPos = { left: null, top: null };
     persistHud();
     applyHudLayout();
   });
 
   document.addEventListener('mousemove', onMove, true);
   document.addEventListener('mouseup', onUp, true);
+}
+
+/** 窗口尺寸变化时重新吸附（徽标位置会跟着变） */
+function installAnchorWatch() {
+  if (installAnchorWatch._done) return;
+  installAnchorWatch._done = true;
+  try {
+    window.addEventListener('resize', () => {
+      if (hudAnchored) applyHudLayout();
+    });
+  } catch {
+    /* 忽略 */
+  }
+  // 页面是 SPA，徽标可能晚于 preload 出现；前几秒多试几次
+  for (const delay of [300, 900, 1800, 3200]) {
+    setTimeout(() => {
+      if (hudAnchored && el(HUD_ID)) applyHudLayout();
+    }, delay);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +598,7 @@ function renderTooltip(tip) {
       '<div>' + escapeHtml((s.localPeakWindows || []).join('、') || '—') + '</div>' +
       (prices ? '<div style="height:6px"></div>' + prices : '') +
       '<div style="height:6px"></div><div>' + guard + '</div>' +
-      '<div style="color:#8b949e;margin-top:6px">拖动可移动 · 双击复位 · 点 − 折叠</div>';
+      '<div style="color:#8b949e;margin-top:6px">拖动左侧 ⠿ 移动 · 双击 ⠿ 恢复吸附到「模式」右侧 · 点 − 折叠<br/>浮层本身点击穿透，不会挡住下面的按钮</div>';
   }
 
   tip.innerHTML = html;
@@ -582,8 +728,25 @@ contextBridge.exposeInMainWorld('dshDesktop', api);
 // 挂载
 // ---------------------------------------------------------------------------
 
+/**
+ * 浮动小卡的显隐。
+ *
+ * 默认**不渲染**：时段与余额已内嵌到菜单栏最右端 —— 那是原生控件，
+ * 不会遮挡页面内容，也不会抢走右侧栏等按钮的点击。需要浮动卡片时，
+ * 从菜单「时段与余额 → 在页面上显示悬浮小卡」开启。
+ */
+function applyFloatHud(on) {
+  if (on) {
+    ensureHud();
+    return;
+  }
+  const hud = el(HUD_ID);
+  if (hud && hud.parentNode) hud.parentNode.removeChild(hud);
+  const tip = el(HUD_TIP_ID);
+  if (tip && tip.parentNode) tip.parentNode.removeChild(tip);
+}
+
 function mountOverlay() {
-  ensureHud();
   installComposerGuard();
 
   api.onBalanceUpdate((state) => {
@@ -598,6 +761,7 @@ function mountOverlay() {
 
   api.onPeakUpdate((state) => {
     peakState = state;
+    applyFloatHud(state.floatHud === true);
     renderPeak();
   });
 

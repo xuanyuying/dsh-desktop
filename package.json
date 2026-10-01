@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop",
-  "version": "1.4.0",
+  "version": "1.3.2",
   "description": "DeepSeek Harness Desktop - Electron app wrapping the full Web UI with real-time balance display and peak/off-peak pricing guard",
   "main": "src/main.js",
   "author": "DSH Desktop",
@@ -9,9 +9,12 @@
     "start": "electron .",
     "dev": "electron . --dev",
     "dist": "electron-builder --win",
-    "test": "node scripts/test-ui-state.js && node scripts/test-updater.js && node scripts/test-peak.js && node scripts/test-peak-guard.js && node scripts/test-peak-integration.js && node scripts/test-preload.js && node scripts/test-menu.js",
+    "test": "node scripts/test-ipc-contract.js && node scripts/test-ui-state.js && node scripts/test-updater.js && node scripts/test-peak.js && node scripts/test-peak-guard.js && node scripts/test-peak-integration.js && node scripts/test-preload.js && node scripts/test-menu.js",
+    "test:harness": "node scripts/test-port-fallback.js && node scripts/test-lib.js && node scripts/test-e2e-auth.js && node scripts/test-token-reuse.js",
     "test:e2e": "node scripts/test-peak-e2e.js",
-    "verify": "node scripts/smoke-test.js && node scripts/test-lib.js && node scripts/test-ui-state.js && node scripts/test-updater.js && node scripts/test-peak.js && node scripts/test-peak-guard.js && node scripts/test-peak-integration.js && node scripts/test-preload.js && node scripts/test-menu.js",
+    "verify": "npm test && npm run test:harness && node scripts/smoke-test.js",
+    "checksums": "node scripts/checksums.js",
+    "icon": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-icon.ps1 && node scripts/gen-ico.js",
     "headless-test": "electron . --headless-test"
   },
   "dependencies": {},

@@ -16,7 +16,21 @@ const path = require('node:path');
 const DEFAULT_FILE = path.join(os.homedir(), '.dsh-desktop', 'ui-state.json');
 const DEFAULT_WINDOW = { width: 1440, height: 900 };
 const MIN_WINDOW = { width: 960, height: 640 };
-const DEFAULT_HUD = { right: 12, top: 12, collapsed: false };
+/**
+ * 悬浮小卡的状态。
+ *
+ * - enabled  默认**开启**：时段与余额同时显示在页面小卡与菜单栏标签上
+ * - anchored 默认**吸附**：贴在会话标题旁「XX模式」徽标右侧约 2 个字符处；
+ *            一旦手动拖动就置为 false，改用手动坐标并记住
+ * - left/top 手动坐标；吸附模式下由页面实时计算，不读这两个值
+ */
+const DEFAULT_HUD = {
+  left: null,
+  top: null,
+  collapsed: false,
+  enabled: true,
+  anchored: true,
+};
 
 /** 状态文件路径（可用 DSH_DESKTOP_DATA_DIR 覆盖，便于测试） */
 function statePath() {
@@ -86,13 +100,24 @@ function saveState(patch, file = statePath()) {
   }
 }
 
-/** 归一化 HUD 位置 */
+/**
+ * 归一化 HUD 状态。
+ *
+ * `enabled` 缺省为 true；`anchored` 缺省为 true。
+ * 兼容旧版本：早期只存 { right, top, collapsed }（没有 anchored），
+ * 那时 enabled 缺省是 false；识别到旧结构时按新默认（开启）处理，
+ * 免得用户升级后小卡莫名不显示。
+ */
 function normalizeHud(hud) {
   const h = hud || {};
+  const legacy = h.anchored === undefined && h.left === undefined && h.right !== undefined;
+  const num = (v) => (Number.isFinite(v) ? clamp(v, 0, 8000) : null);
   return {
-    right: clamp(Number.isFinite(h.right) ? h.right : DEFAULT_HUD.right, 0, 4000),
-    top: clamp(Number.isFinite(h.top) ? h.top : DEFAULT_HUD.top, 0, 4000),
+    left: num(h.left),
+    top: num(h.top),
     collapsed: h.collapsed === true,
+    enabled: legacy ? DEFAULT_HUD.enabled : h.enabled !== false,
+    anchored: h.anchored === undefined ? DEFAULT_HUD.anchored : h.anchored === true,
   };
 }
 

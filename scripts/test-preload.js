@@ -26,7 +26,9 @@ const mockElectron = {
     // HUD 位置的主存储：主进程同步返回（证明不再依赖 localStorage）
     sendSync: (channel) => {
       ipcInvoked.push('sync:' + channel);
-      if (channel === 'ui:get-hud') return { right: 40, top: 60, collapsed: false };
+      if (channel === 'ui:get-hud') {
+        return { left: null, top: null, collapsed: false, enabled: true, anchored: true };
+      }
       return undefined;
     },
     send: () => {},
@@ -42,6 +44,10 @@ Module._load = function (request, parent, isMain) {
 
 // ---- 最小 DOM ----
 const elements = new Map();
+/** 所有创建过的元素，供 querySelectorAll 使用 */
+const allElements = [];
+/** document.addEventListener 捕获的处理器，便于模拟 resize 等事件 */
+const docListeners = {};
 function makeElement(tag) {
   const el = {
     tagName: tag.toUpperCase(),
@@ -52,7 +58,12 @@ function makeElement(tag) {
     textContent: '',
     _innerHTML: '',
     listeners: {},
+    _rect: { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 },
+    _fontSize: '12px',
     ownerDocument: global.document,
+    getBoundingClientRect() {
+      return this._rect;
+    },
     set id(v) {
       this._id = v;
       if (v) elements.set(v, this);
@@ -77,7 +88,15 @@ function makeElement(tag) {
     },
     appendChild(child) {
       this.children.push(child);
+      child.parentNode = this;
       if (child.id) elements.set(child.id, child);
+      return child;
+    },
+    removeChild(child) {
+      const i = this.children.indexOf(child);
+      if (i >= 0) this.children.splice(i, 1);
+      if (child.id) elements.delete(child.id);
+      child.parentNode = null;
       return child;
     },
     addEventListener(evt, fn) {
@@ -91,6 +110,7 @@ function makeElement(tag) {
       return this.attrs[k];
     },
   };
+  allElements.push(el);
   return el;
 }
 global.document = {
@@ -104,7 +124,28 @@ global.document = {
     el.ownerDocument = global.document;
     return el;
   },
-  addEventListener() {},
+  querySelectorAll(selector) {
+    const tags = String(selector)
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+    return allElements.filter((e) => tags.includes(e.tagName));
+  },
+  addEventListener(evt, fn) {
+    docListeners[evt] = fn;
+  },
+};
+
+/** 页面窗对象：preload 会用它读尺寸/字号并监听 resize */
+const winListeners = {};
+global.window = {
+  innerWidth: 1440,
+  innerHeight: 860,
+  getComputedStyle: (node) => ({ fontSize: (node && node._fontSize) || '12px' }),
+  addEventListener(evt, fn) {
+    winListeners[evt] = fn;
+  },
+  removeEventListener() {},
 };
 
 let testsPassed = 0;
@@ -142,27 +183,95 @@ const HUD = 'dsh-desktop-hud';
     assert(typeof api[m] === 'function', `api.${m} 存在`);
   }
 
-  // 2. HUD 注入（合并成单一小卡）
+  // 2. 收到主进程状态前不渲染（渲染与否由 payload.floatHud 决定）
+  assert(
+    !global.document.documentElement.children.some((c) => c.id === HUD),
+    '收到状态前不渲染浮动小卡'
+  );
+
+  const peakCb = ipcListeners['peak:update'];
+  const balCb = ipcListeners['balance:update'];
+  assert(typeof peakCb === 'function', '监听 peak:update');
+  assert(typeof balCb === 'function', '监听 balance:update');
+
+  // 2.1 造一个「XX模式」徽标，用于验证吸附位置
+  const badge = global.document.createElement('span');
+  badge.textContent = '创造模式';
+  badge._fontSize = '13px';
+  badge._rect = { left: 576, top: 70, right: 640, bottom: 90, width: 64, height: 20 };
+
+  // 2.2 打开小卡后应吸附在徽标右侧「2 个字符」处
+  const anchoredLeft = Math.round(640 + 2 * 13); // 640 + 26 = 666
+
+  // 3. 默认开启：主进程一推送状态就出现浮层，并吸附在「XX模式」右侧
+  //    倒计时按毫秒向下取整，这里多给 30 秒余量，避免断言因几毫秒的渲染耗时抖动
+  peakCb(null, {
+    isPeak: false,
+    nextChangeAt: Date.now() + 2 * 60 * 60 * 1000 + 30 * 1000,
+    guardEnabled: true,
+    allowed: false,
+    guardAlive: true,
+    floatHud: true,
+  });
   const hud = global.document.documentElement.children.find((c) => c.id === HUD);
-  assert(!!hud, 'HUD 小卡已注入');
+  assert(!!hud, 'floatHud=true 时浮层被创建');
   const hudStyle = hud.attrs.style || '';
   assert(hudStyle.includes('position: fixed'), 'HUD 为 fixed 定位');
-  assert(hudStyle.includes('top: 12px'), '默认贴顶（离开底部输入区）');
   assert(hudStyle.includes('opacity: 0.45'), '默认半透明，减少对正文的遮挡');
   assert(hudStyle.includes('z-index'), 'HUD 有 z-index');
-  assert(typeof hud.listeners.mousedown === 'function', '支持拖动（mousedown 已绑定）');
-  assert(typeof hud.listeners.dblclick === 'function', '支持双击复位');
-  assert(typeof hud.listeners.mouseenter === 'function', '悬停展开详情');
+  assert(hudStyle.includes('pointer-events: none'), '★ 浮层容器点击穿透（不会挡住下面的按钮）');
+  const handle = global.document.getElementById(HUD + '-handle');
+  assert(!!handle, '存在拖拽手柄 ⠿');
+  // 手柄与折叠按钮的内联样式写在 innerHTML 模板里，直接查模板字符串
+  const inlineStyles = String(hud._innerHTML || '');
+  assert(
+    (inlineStyles.match(/pointer-events:auto/g) || []).length >= 2,
+    '手柄与折叠按钮都可交互（pointer-events:auto）'
+  );
+  assert(typeof handle.listeners.mousedown === 'function', '支持拖动（手柄 mousedown 已绑定）');
+  assert(typeof handle.listeners.dblclick === 'function', '支持双击恢复吸附');
+  assert(typeof handle.listeners.mouseenter === 'function', '手柄悬停展开详情');
 
-  // 3. 旧的两个底部浮层必须不复存在（它们会压住输入框并抢点击）
+  // 3.1 吸附位置 = 徽标右边缘 + 2 个字符（按徽标字号算）
+  assert(
+    hud.style.left === anchoredLeft + 'px',
+    `吸附在「XX模式」右侧 2 字符处: left=${hud.style.left}（期望 ${anchoredLeft}px）`
+  );
+  assert(hud.style.top === '70px', '与徽标同一行: top=' + hud.style.top);
+  assert(hud.style.right === 'auto', '吸附模式下不再用 right 定位');
+
+  // 3.2 拖动即解除吸附，并记住手动坐标
+  hud._rect = { left: anchoredLeft, top: 70, right: anchoredLeft + 200, bottom: 90, width: 200, height: 20 };
+  handle.listeners.mousedown({
+    button: 0,
+    clientX: 700,
+    clientY: 80,
+    target: { id: '' },
+    preventDefault() {},
+  });
+  docListeners.mousemove({ clientX: 800, clientY: 200 });
+  docListeners.mouseup({});
+  assert(hud.style.left === '766px', '拖动后按手动坐标摆放: ' + hud.style.left);
+  assert(hud.style.top === '190px', '拖动后 top 同步: ' + hud.style.top);
+
+  // 3.3 已解除吸附时，窗口缩放不应把它拽回徽标旁
+  if (typeof winListeners.resize === 'function') winListeners.resize();
+  assert(hud.style.left === '766px', '解除吸附后缩放窗口不会重算位置: ' + hud.style.left);
+
+  // 3.4 双击恢复吸附
+  handle.listeners.dblclick({});
+  assert(
+    hud.style.left === anchoredLeft + 'px',
+    '双击后恢复吸附: left=' + hud.style.left
+  );
+
+  // 4. 旧的两个底部浮层必须不复存在（它们会压住输入框并抢点击）
   const legacy = global.document.documentElement.children.filter(
     (c) => c.id === 'dsh-desktop-balance-overlay' || c.id === 'dsh-desktop-peak-overlay'
   );
   assert(legacy.length === 0, '旧的底部浮层已移除（回归：不再遮挡底部对话）');
 
-  // 4. 余额渲染
-  const balCb = ipcListeners['balance:update'];
-  assert(typeof balCb === 'function', '监听 balance:update');
+  // 5. 余额渲染
   balCb(null, {
     ok: true,
     isAvailable: true,
@@ -182,19 +291,10 @@ const HUD = 'dsh-desktop-hud';
     '失败状态渲染'
   );
 
-  // 5. 峰谷渲染
-  const peakCb = ipcListeners['peak:update'];
-  assert(typeof peakCb === 'function', '监听 peak:update');
+  // 6. 峰谷渲染
   const peakText = () => global.document.getElementById(HUD + '-peak-text').textContent;
   const peakIcon = () => global.document.getElementById(HUD + '-peak-text-icon').textContent;
 
-  peakCb(null, {
-    isPeak: false,
-    nextChangeAt: Date.now() + 2 * 60 * 60 * 1000,
-    guardEnabled: true,
-    allowed: false,
-    guardAlive: true,
-  });
   assert(peakIcon() === '🟢', '空闲图标为绿');
   assert(peakText().includes('空闲 5 折'), '空闲文案: ' + peakText());
   assert(peakText().includes('2 小时'), '倒计时按本机计算');
@@ -205,6 +305,7 @@ const HUD = 'dsh-desktop-hud';
     guardEnabled: true,
     allowed: false,
     guardAlive: true,
+    floatHud: true,
   });
   assert(peakIcon() === '🔴', '高峰守卫运行时图标为红');
   assert(peakText().includes('高峰已暂停'), '高峰守卫运行时文案: ' + peakText());
@@ -215,6 +316,7 @@ const HUD = 'dsh-desktop-hud';
     guardEnabled: true,
     allowed: true,
     guardAlive: true,
+    floatHud: true,
   });
   assert(peakIcon() === '🟠' && peakText().includes('已放行'), '临时放行文案: ' + peakText());
 
@@ -224,10 +326,11 @@ const HUD = 'dsh-desktop-hud';
     guardEnabled: false,
     allowed: false,
     guardAlive: true,
+    floatHud: true,
   });
   assert(peakText().includes('守卫已关'), '守卫关闭文案: ' + peakText());
 
-  // 6. 悬停详情
+  // 7. 悬停详情
   const tip = hud.children.find((c) => c.id === 'dsh-desktop-hud-tooltip');
   assert(!!tip, 'HUD tooltip 已创建');
   peakCb(null, {
@@ -236,6 +339,7 @@ const HUD = 'dsh-desktop-hud';
     guardEnabled: true,
     allowed: false,
     guardAlive: false,
+    floatHud: true,
     countdownText: '距离进入空闲时段（5 折）还有 1 小时',
     localPeakWindows: ['09:00–12:00', '14:00–18:00'],
     prices: [{ label: 'Flash 输出', value: '$1.2 / 1M（空闲 $0.6）' }],
@@ -247,13 +351,13 @@ const HUD = 'dsh-desktop-hud';
     ],
     fetchedAt: Date.now(),
   });
-  hud.listeners.mouseenter();
+  handle.listeners.mouseenter();
   assert(tip.innerHTML.includes('守卫未生效'), '守卫失效时明确告警');
   assert(tip.innerHTML.includes('Flash 输出'), '详情含价目');
   assert(tip.innerHTML.includes('09:00–12:00'), '详情含本机高峰窗口');
-  assert(tip.innerHTML.includes('拖动可移动'), '详情提示拖动/复位交互');
+  assert(tip.innerHTML.includes('点击穿透'), '详情提示浮层点击穿透 + 手柄交互');
 
-  // 7. 折叠
+  // 8. 折叠
   const body = global.document.getElementById(HUD + '-body');
   assert(body && body.style.display !== 'none', '默认展开');
   hud.listeners.click({ target: { id: HUD + '-toggle' } });
@@ -262,20 +366,33 @@ const HUD = 'dsh-desktop-hud';
   hud.listeners.click({ target: { id: HUD + '-toggle' } });
   assert(body.style.display === 'block', '再次点击展开');
 
-  // 8. 位置应用（来自主进程，而非 localStorage）
+  // 9. 位置来源
   assert(
     ipcInvoked.includes('sync:ui:get-hud'),
-    '启动时同步读取主进程保存的 HUD 位置'
+    '启动时同步读取主进程保存的 HUD 状态'
   );
-  assert(hud.style.right === '40px', '应用主进程返回的 right（而非本地默认）: ' + hud.style.right);
-  assert(hud.style.top === '60px', '应用主进程返回的 top: ' + hud.style.top);
-  assert(hud.style.left === 'auto' && hud.style.bottom === 'auto', '不使用 bottom/left 定位');
+  assert(hud.style.left !== '' && hud.style.left !== 'auto', '使用 left 定位（吸附/手动都用它）');
+  assert(hud.style.bottom === 'auto', '不使用 bottom 定位');
   assert(
     ipcInvoked.includes('ui:set-hud'),
-    '折叠/拖动会写回主进程（端口变化也不丢位置）'
+    '拖动/折叠会写回主进程（端口变化也不丢位置）'
   );
 
-  // 9. 启动时请求了初始数据
+  // 10. 菜单里关闭后浮层被移除
+  peakCb(null, {
+    isPeak: false,
+    nextChangeAt: Date.now() + 60 * 60 * 1000,
+    guardEnabled: true,
+    allowed: false,
+    guardAlive: true,
+    floatHud: false,
+  });
+  assert(
+    !global.document.documentElement.children.some((c) => c.id === HUD),
+    'floatHud=false 时浮层被移除（不再遮挡页面）'
+  );
+
+  // 11. 启动时请求了初始数据
   assert(ipcInvoked.includes('peak:refresh'), '启动时请求峰谷状态');
   assert(ipcInvoked.includes('balance:refresh'), '启动时请求余额');
 
