@@ -394,6 +394,25 @@ function buildWebArgs(dshEntry, patches = extraPatches) {
     : ['web', ...patchArgs, ...appArgs];
 }
 
+/**
+ * 构造子进程环境变量。
+ *
+ * 打包后的应用没有独立的 node.exe，只能用自身 exe 充当 Node 运行时
+ * （`resolvePackageEntry` 返回 `command: process.execPath`）。这种情况下
+ * **必须**显式设置 `ELECTRON_RUN_AS_NODE=1`，否则 Electron 会把它当作
+ * 第二个应用实例启动：再跑一遍 main.js、抢单实例锁失败、白起一堆进程。
+ * 实测每次启动都会留下这样一条记录（startup.log 中 lock=false 那行）。
+ */
+function buildSpawnEnv(entry) {
+  const env = { ...process.env, ...getProxyEnv() };
+  if (entry && entry.command === process.execPath) {
+    env.ELECTRON_RUN_AS_NODE = '1';
+  } else {
+    delete env.ELECTRON_RUN_AS_NODE;
+  }
+  return env;
+}
+
 /** 尝试 spawn dsh web 并等待就绪（同时捕获认证 token URL） */
 async function trySpawnWeb(dshEntry, patches = extraPatches) {
   // 启动器参数顺序：--patch（web 子命令选项）必须在 app 参数之前，
@@ -408,7 +427,8 @@ async function trySpawnWeb(dshEntry, patches = extraPatches) {
     let child = null;
     try {
       // 0.1.5+ 支持代理环境变量：显式传递，确保桌面端代理设置生效
-      const env = { ...process.env, ...getProxyEnv() };
+      // （其中包含「用自身 exe 当 Node」时必须的 ELECTRON_RUN_AS_NODE）
+      const env = buildSpawnEnv(dshEntry);
       child = spawn(dshEntry.command, args, {
         env,
         cwd: os.homedir(),
@@ -716,6 +736,7 @@ module.exports = {
   killDshWebOnPort,
   setExtraPatches,
   buildWebArgs,
+  buildSpawnEnv,
   getLocalDshVersion,
   getLatestDshVersion,
   isNewerVersion,

@@ -111,6 +111,14 @@ function assert(cond, name) {
     const second = balance.ensureConfigFile();
     assert(second.created === false, '已存在时不重复创建');
 
+    // 6c. 子进程环境：用自身 exe 当 Node 时必须开 ELECTRON_RUN_AS_NODE
+    //     （否则 Electron 会把它当成"第二个应用实例"启动：跑一遍 main.js、
+    //       抢单实例锁失败。startup.log 里那条 lock=false 就是它）
+    const selfEnv = harness.buildSpawnEnv({ command: process.execPath, script: 'x.js' });
+    assert(selfEnv.ELECTRON_RUN_AS_NODE === '1', '用自身 exe 当 Node 时设置 ELECTRON_RUN_AS_NODE=1');
+    const nodeEnv = harness.buildSpawnEnv({ command: 'C:\\nodejs\\node.exe', script: 'x.js' });
+    assert(nodeEnv.ELECTRON_RUN_AS_NODE === undefined, '用真正的 node 时不设置该变量');
+
     // 7. 未配置 Key 错误分支
     const noKey = await balance.getBalanceData(null);
     assert(noKey.ok === false && noKey.error.includes('DEEPSEEK_API_KEY'), '无 Key 错误分支');
