@@ -2,6 +2,10 @@
  * lib 模块集成测试（纯 Node，无需 Electron GUI）
  * 覆盖：版本检测、token 解析、服务启动与认证、余额、API Key
  * 用法: node scripts/test-lib.js
+ *
+ * 注意：ensureHarnessRunning() 现在**不会**结束占用端口的进程（端口冲突时
+ * 改为退让到空闲端口）。但若本机 3080 上已有服务，本测试仍会被跳过启动环节，
+ * 以免在开发机上多起一个 harness 实例。
  */
 'use strict';
 
@@ -80,22 +84,37 @@ function assert(cond, name) {
 
   // 9. 【核心】服务启动 + 认证 token 捕获（dsh 0.1.5+ 关键路径）
   console.log('\n--- 服务启动与认证（核心）---');
-  const result = await harness.ensureHarnessRunning();
-  assert(!!result, 'ensureHarnessRunning 返回结果');
-  assert(typeof result.started === 'boolean', `started 标志: ${result.started}`);
-  assert(typeof result.reused === 'boolean', `reused 标志: ${result.reused}`);
+  //
+  // 开发机上 3080 往往已有服务在跑。ensureHarnessRunning() 已改为「端口冲突时
+  // 退让到空闲端口、绝不结束他人进程」，但那会在本机多起一个 harness 实例，
+  // 对纯测试而言是多余副作用，因此端口被占时跳过这一段。
+  const portBusy = await harness.isPortOpen(harness.HARNESS_HOST, harness.HARNESS_PORT);
+  const wouldSpawnDuplicate =
+    portBusy && !harness.getAuthUrl() && !(await harness.isHarnessUsable());
 
-  const alive = await harness.isHarnessReady();
-  assert(alive === true, '服务已监听（任意 HTTP 响应）');
-
-  const authUrl = harness.getAuthUrl();
-  if (authUrl) {
-    assert(authUrl.includes('token='), `认证 token URL 已捕获`);
-    console.log(`       -> ${authUrl.slice(0, 60)}...`);
+  if (wouldSpawnDuplicate) {
+    console.log('  SKIP: 端口 ' + harness.HARNESS_PORT + ' 已被既有服务占用。');
+    console.log('        跳过启动环节，避免在开发机上多起一个 harness 实例。');
+    console.log('        如需完整测试，请设置其它 DSH_DESKTOP_PORT。');
+    assert(true, 'ensureHarnessRunning 已跳过（不在开发机上另起实例）');
   } else {
-    // 旧版 dsh 无需认证也算通过
-    const usable = await harness.isHarnessUsable();
-    assert(usable === true, '无需 token（旧版或已认证，直接可访问）');
+    const result = await harness.ensureHarnessRunning();
+    assert(!!result, 'ensureHarnessRunning 返回结果');
+    assert(typeof result.started === 'boolean', `started 标志: ${result.started}`);
+    assert(typeof result.reused === 'boolean', `reused 标志: ${result.reused}`);
+
+    const alive = await harness.isHarnessReady();
+    assert(alive === true, '服务已监听（任意 HTTP 响应）');
+
+    const authUrl = harness.getAuthUrl();
+    if (authUrl) {
+      assert(authUrl.includes('token='), `认证 token URL 已捕获`);
+      console.log(`       -> ${authUrl.slice(0, 60)}...`);
+    } else {
+      // 旧版 dsh 无需认证也算通过
+      const usable = await harness.isHarnessUsable();
+      assert(usable === true, '无需 token（旧版或已认证，直接可访问）');
+    }
   }
 
   // getLoadUrl 应返回 token URL（若有）或裸 URL

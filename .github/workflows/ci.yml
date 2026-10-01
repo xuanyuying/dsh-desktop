@@ -1,0 +1,68 @@
+name: CI
+
+# 只跑「可独立运行」的测试：不依赖已安装的 dsh、不依赖真实 API Key、
+# 不占用本机 3080 端口。需要真实 harness 的测试（test-lib / smoke-test /
+# test-e2e-auth / test-token-reuse / test-peak-e2e / test-orphan-cleanup）
+# 一律不在此运行。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 单元与集成测试 (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 测试全部 mock 了 electron，不需要下载 Electron 二进制
+      - name: 安装依赖（跳过 Electron 下载）
+        run: npm ci --ignore-scripts
+
+      - name: 语法检查
+        shell: pwsh
+        run: |
+          $failed = @()
+          Get-ChildItem -Path src -Recurse -Filter *.js | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $_.FullName }
+          }
+          # 守卫插件是 ESM，用 --input-type=module 校验
+          node --input-type=module -e "import('./resources/peak-guard.mjs').then(m => { if (typeof m.apply !== 'function') { throw new Error('peak-guard 缺少 apply') } })"
+          if ($LASTEXITCODE -ne 0) { $failed += 'resources/peak-guard.mjs' }
+          if ($failed.Count -gt 0) {
+            Write-Error ("语法检查失败: " + ($failed -join ', '))
+            exit 1
+          }
+          Write-Host "语法检查通过"
+
+      - name: 运行测试
+        run: npm test
+
+      - name: 校验打包配置引用的资源都存在
+        shell: pwsh
+        run: |
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $missing = @()
+          foreach ($r in $pkg.build.extraResources) {
+            if (-not (Test-Path $r.from)) { $missing += $r.from }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error ("extraResources 缺少文件: " + ($missing -join ', '))
+            exit 1
+          }
+          Write-Host "打包资源检查通过"

@@ -5,8 +5,20 @@
  *       DSH Desktop 应自动清理它并启动自己的服务（捕获新 token）。
  *
  * 用法: node scripts/test-orphan-cleanup.js
+ *
+ * ⚠ 破坏性测试：它会 taskkill 占用 3080 的 dsh web 进程。如果那是用户正在
+ *   使用的 harness（甚至承载当前对话的那个），运行本脚本会直接中断会话。
+ *   因此必须显式设置 DSH_DESKTOP_TEST_DESTRUCTIVE=1 才会执行。
  */
 'use strict';
+
+if (process.env.DSH_DESKTOP_TEST_DESTRUCTIVE !== '1') {
+  console.log('=== 孤儿服务清理验证 ===');
+  console.log('已跳过：这是破坏性测试，会终止占用 3080 的 dsh web 进程。');
+  console.log('若确认该端口上没有正在使用的会话，请这样运行：');
+  console.log('  $env:DSH_DESKTOP_TEST_DESTRUCTIVE=1; node scripts/test-orphan-cleanup.js');
+  process.exit(0);
+}
 
 const { spawn, execSync } = require('node:child_process');
 const http = require('node:http');

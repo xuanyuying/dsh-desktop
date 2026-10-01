@@ -10,9 +10,32 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 const HARNESS_HOST = process.env.DSH_DESKTOP_HOST || '127.0.0.1';
-const HARNESS_PORT = Number(process.env.DSH_DESKTOP_PORT || 3080);
-const HARNESS_URL = `http://${HARNESS_HOST}:${HARNESS_PORT}`;
+/** 首选端口；被外部服务占用时自动退让到空闲端口 */
+const PREFERRED_PORT = Number(process.env.DSH_DESKTOP_PORT || 3080);
 const STARTUP_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * 实际使用的端口。
+ *
+ * 默认**不再** taskkill 占用端口的进程 —— 那可能正是用户正在使用的 harness
+ * （甚至承载当前会话），误杀会直接中断用户的工作。改为退让到下一个空闲端口；
+ * 确需结束占用进程时，由菜单项显式触发 killDshWebOnPort。
+ */
+let activePort = PREFERRED_PORT;
+let fellBackFrom = null;
+
+/** 当前 harness 基址 */
+function getHarnessUrl(port = activePort) {
+  return `http://${HARNESS_HOST}:${port}`;
+}
+
+/** 在 [start, start+count) 中找第一个空闲端口 */
+async function findFreePort(start, count = 20) {
+  for (let p = start; p < start + count && p <= 65535; p++) {
+    if (!(await isPortOpen(HARNESS_HOST, p, 500))) return p;
+  }
+  return null;
+}
 
 let harnessProcess = null;
 let startedByUs = false;
@@ -20,6 +43,23 @@ let startedByUs = false;
 let authUrl = null;
 // 服务启动输出缓冲（用于解析 token URL）
 let startupOutput = '';
+// 由桌面端注入的额外 patch 覆盖层（如峰谷守卫插件）
+let extraPatches = [];
+// 本次启动是否真的带上了 patch（兜底重试会去掉 patch，此时守卫不生效）
+let guardPatchesApplied = false;
+
+/**
+ * 设置额外 patch 覆盖层。
+ *
+ * 注意参数顺序：`--patch` 是 `dsh web` 子命令自己的选项，而 `--port`/`--no-open`
+ * 属于被透传给 app 的参数。启动器一旦遇到不认识的选项（`--port`）就会把其后
+ * 全部内容原样透传，因此 `--patch` 必须排在 app 参数之前，否则会报
+ * "unknown option '--patch'"。
+ * @param {string[]} list - patch 文件绝对路径
+ */
+function setExtraPatches(list) {
+  extraPatches = Array.isArray(list) ? list.filter(Boolean).slice() : [];
+}
 
 /** 探测端口是否已被监听 */
 function isPortOpen(host, port, timeout = 1500) {
@@ -48,7 +88,7 @@ function isPortOpen(host, port, timeout = 1500) {
  */
 async function isHarnessReady() {
   try {
-    const res = await fetch(`${HARNESS_URL}/`, {
+    const res = await fetch(`${getHarnessUrl()}/`, {
       signal: AbortSignal.timeout(3000),
       redirect: 'manual',
     });
@@ -65,7 +105,7 @@ async function isHarnessReady() {
  */
 async function isHarnessUsable() {
   try {
-    const res = await fetch(`${HARNESS_URL}/`, {
+    const res = await fetch(`${getHarnessUrl()}/`, {
       signal: AbortSignal.timeout(3000),
       redirect: 'manual',
     });
@@ -77,7 +117,7 @@ async function isHarnessUsable() {
 
 /** 获取当前应加载的 URL（优先带 token 的认证 URL） */
 function getLoadUrl() {
-  return authUrl || HARNESS_URL;
+  return authUrl || getHarnessUrl();
 }
 
 /** 取得启动输出中解析到的 token URL */
@@ -199,38 +239,49 @@ function resolvePackageEntry(pkgDir) {
  * 确保 dsh web 服务可用。
  *
  * 处理 dsh 0.1.5+ 的认证机制：服务需用启动时打印的带 token URL 认证。
- * 三种情况：
- *  A. 端口空闲 → 启动 dsh web，捕获 token URL
- *  B. 端口被占用且可直接访问(200) → 复用（cookie 或旧版无需认证）
- *  C. 端口被占用但需认证(401)且我们无 token → 清理孤儿服务后重启
  *
- * @returns {Promise<{started: boolean, entry: object|null, authUrl: string|null, reused: boolean}>}
+ * 端口策略（默认永不误杀）：
+ *  A. 首选端口空闲          → 在其上启动，捕获 token URL
+ *  B. 首选端口可访问(200)   → 直接复用
+ *  C. 首选端口是本应用启动的 → 用已有 token 复用
+ *  D. 首选端口被外部服务占用 → **退让到下一个空闲端口**，不结束任何进程
+ *
+ * 需要清理占用进程时由菜单显式触发 killDshWebOnPort。
+ *
+ * @returns {Promise<{started: boolean, entry: object|null, authUrl: string|null,
+ *   reused: boolean, port: number, fellBackFrom: number|null}>}
  */
 async function ensureHarnessRunning() {
-  const portBusy = await isPortOpen(HARNESS_HOST, HARNESS_PORT);
+  activePort = PREFERRED_PORT;
+  fellBackFrom = null;
 
-  if (portBusy) {
+  if (await isPortOpen(HARNESS_HOST, PREFERRED_PORT)) {
     // B. 已就绪且可直接使用 → 复用
+    activePort = PREFERRED_PORT;
     if (await isHarnessUsable()) {
       startedByUs = false;
       logLine('复用已就绪的 dsh web 服务（无需认证）');
-      return { started: false, entry: null, authUrl: authUrl, reused: true };
+      return { started: false, entry: null, authUrl, reused: true, port: activePort, fellBackFrom };
     }
-    // C. 端口被占用但需认证：若我们持有 token（本次会话启动的），可直接用
-    if (authUrl) {
+    // C. 需认证但本次进程持有 token（例如刚启动过）→ 复用
+    if (authUrl && authUrl.includes(`:${PREFERRED_PORT}/`)) {
       startedByUs = true;
       logLine('复用本应用启动的 dsh web 服务（带认证 URL）');
-      return { started: false, entry: null, authUrl, reused: true };
+      return { started: false, entry: null, authUrl, reused: true, port: activePort, fellBackFrom };
     }
-    // 孤儿服务：端口被占但无法认证 → 清理后重启
-    logLine('端口 ' + HARNESS_PORT + ' 被占用但服务需认证且本应用无凭证，清理孤儿服务...');
-    const killed = killDshWebOnPort(HARNESS_PORT);
-    if (killed) {
-      logLine('已清理孤儿 dsh web 进程，等待端口释放...');
-      await new Promise((r) => setTimeout(r, 2000));
-    } else {
-      logLine('未能清理占用进程，仍尝试启动（可能失败）');
+    // D. 外部/遗留服务占用且无法认证 → 退让，绝不 taskkill
+    const alt = await findFreePort(PREFERRED_PORT + 1, 20);
+    if (alt === null) {
+      throw new Error(
+        `端口 ${PREFERRED_PORT} 已被其它服务占用，且在 ${PREFERRED_PORT + 1}–${PREFERRED_PORT + 20} 内找不到空闲端口。` +
+          '本应用不会自动结束占用端口的进程；请手动关闭它，或在菜单「工具 → 结束占用端口的 dsh 服务」中处理。'
+      );
     }
+    activePort = alt;
+    fellBackFrom = PREFERRED_PORT;
+    logLine(
+      `端口 ${PREFERRED_PORT} 被其它服务占用，自动改用 ${alt}（不会结束任何进程）`
+    );
   }
 
   // 前提 1：定位 dsh 入口（找不到则自动安装）
@@ -247,29 +298,50 @@ async function ensureHarnessRunning() {
 
   // 前提 2：启动 dsh web（多方式重试）
   let started = false;
-  const attempts = [{ entry: dshEntry, label: 'node+bin.js' }];
+  let usedPatches = extraPatches;
+  const attempts = [{ entry: dshEntry, label: 'node+bin.js', patches: extraPatches }];
   if (dshEntry.script) {
     const cmdEntry = findDshCmdEntry();
-    if (cmdEntry) attempts.push({ entry: cmdEntry, label: 'dsh.cmd' });
+    if (cmdEntry) attempts.push({ entry: cmdEntry, label: 'dsh.cmd', patches: extraPatches });
   } else {
     const nodeEntry = findDshNodeEntry();
-    if (nodeEntry) attempts.unshift({ entry: nodeEntry, label: 'node+bin.js' });
+    if (nodeEntry) attempts.unshift({ entry: nodeEntry, label: 'node+bin.js', patches: extraPatches });
+  }
+  // 兜底：极老的 dsh 可能不认识 web 子命令的 --patch。去掉注入重试一次，
+  // 保证「服务能起来」优先于「守卫被注入」——守卫缺失时界面会明确告警。
+  if (extraPatches.length > 0) {
+    attempts.push({ entry: dshEntry, label: 'node+bin.js (无 --patch 兜底)', patches: [] });
   }
 
   for (const attempt of attempts) {
     logLine(`启动 dsh web (${attempt.label})...`);
-    started = await trySpawnWeb(attempt.entry);
-    if (started) break;
+    started = await trySpawnWeb(attempt.entry, attempt.patches);
+    if (started) {
+      usedPatches = attempt.patches;
+      if (attempt.patches.length === 0 && extraPatches.length > 0) {
+        logLine('警告：本次启动未能注入峰谷守卫，高峰零 token 保护不可用');
+      }
+      break;
+    }
     logLine(`方式 ${attempt.label} 启动失败，尝试下一种...`);
   }
 
   if (!started) {
     throw new Error(
-      'dsh web 服务启动失败。可能原因：端口 ' + HARNESS_PORT + ' 被其他程序占用，或 dsh 安装异常。'
+      'dsh web 服务启动失败。可能原因：端口 ' + activePort + ' 被其他程序占用，或 dsh 安装异常。'
     );
   }
   startedByUs = true;
-  return { started: true, entry: dshEntry, authUrl: authUrl, reused: false };
+  guardPatchesApplied = usedPatches.length > 0;
+  return {
+    started: true,
+    entry: dshEntry,
+    authUrl: authUrl,
+    reused: false,
+    guardPatches: guardPatchesApplied,
+    port: activePort,
+    fellBackFrom,
+  };
 }
 
 /** 清理占用指定端口的 dsh web 孤儿进程（仅匹配 node + dsh web 命令行） */
@@ -307,12 +379,27 @@ function killDshWebOnPort(port) {
   }
 }
 
+/**
+ * 拼装 dsh web 的启动参数。
+ * 单独导出以便单测断言 `--patch` 与 app 参数的相对顺序。
+ * @param {{command: string, script?: string}} dshEntry
+ * @param {string[]} patches - patch 文件绝对路径
+ * @returns {string[]}
+ */
+function buildWebArgs(dshEntry, patches = extraPatches) {
+  const patchArgs = patches.filter(Boolean).flatMap((p) => ['--patch', p]);
+  const appArgs = ['--port', String(activePort), '--no-open'];
+  return dshEntry.script
+    ? [dshEntry.script, 'web', ...patchArgs, ...appArgs]
+    : ['web', ...patchArgs, ...appArgs];
+}
+
 /** 尝试 spawn dsh web 并等待就绪（同时捕获认证 token URL） */
-async function trySpawnWeb(dshEntry) {
+async function trySpawnWeb(dshEntry, patches = extraPatches) {
+  // 启动器参数顺序：--patch（web 子命令选项）必须在 app 参数之前，
+  // 否则 --port 之后的 --patch 会被透传给 app 并报 unknown option。
   // --no-open：阻止 dsh web 自动打开系统浏览器（界面由 DSH Desktop 窗口承载）
-  const args = dshEntry.script
-    ? [dshEntry.script, 'web', '--port', String(HARNESS_PORT), '--no-open']
-    : ['web', '--port', String(HARNESS_PORT), '--no-open'];
+  const args = buildWebArgs(dshEntry, patches);
 
   authUrl = null;
   startupOutput = '';
@@ -606,8 +693,16 @@ function stopHarnessIfOwned() {
 
 module.exports = {
   HARNESS_HOST,
-  HARNESS_PORT,
-  HARNESS_URL,
+  PREFERRED_PORT,
+  // 动态只读属性：端口可能在启动时因冲突而退让
+  get HARNESS_PORT() {
+    return activePort;
+  },
+  get HARNESS_URL() {
+    return getHarnessUrl();
+  },
+  getHarnessUrl,
+  findFreePort,
   isPortOpen,
   isHarnessReady,
   isHarnessUsable,
@@ -619,6 +714,8 @@ module.exports = {
   stopHarnessIfOwned,
   autoInstallDsh,
   killDshWebOnPort,
+  setExtraPatches,
+  buildWebArgs,
   getLocalDshVersion,
   getLatestDshVersion,
   isNewerVersion,
@@ -626,5 +723,8 @@ module.exports = {
   getProxyEnv,
   get startedByUs() {
     return startedByUs;
+  },
+  get guardPatchesApplied() {
+    return guardPatchesApplied;
   },
 };

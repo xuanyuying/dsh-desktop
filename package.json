@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop",
-  "version": "1.2.2",
-  "description": "DeepSeek Harness Desktop - Electron app wrapping the full Web UI with real-time balance display",
+  "version": "1.4.0",
+  "description": "DeepSeek Harness Desktop - Electron app wrapping the full Web UI with real-time balance display and peak/off-peak pricing guard",
   "main": "src/main.js",
   "author": "DSH Desktop",
   "license": "MIT",
@@ -9,7 +9,9 @@
     "start": "electron .",
     "dev": "electron . --dev",
     "dist": "electron-builder --win",
-    "verify": "node scripts/smoke-test.js && node scripts/test-lib.js && node scripts/test-preload.js",
+    "test": "node scripts/test-ui-state.js && node scripts/test-updater.js && node scripts/test-peak.js && node scripts/test-peak-guard.js && node scripts/test-peak-integration.js && node scripts/test-preload.js && node scripts/test-menu.js",
+    "test:e2e": "node scripts/test-peak-e2e.js",
+    "verify": "node scripts/smoke-test.js && node scripts/test-lib.js && node scripts/test-ui-state.js && node scripts/test-updater.js && node scripts/test-peak.js && node scripts/test-peak-guard.js && node scripts/test-peak-integration.js && node scripts/test-preload.js && node scripts/test-menu.js",
     "headless-test": "electron . --headless-test"
   },
   "dependencies": {},
@@ -23,6 +25,16 @@
     "files": [
       "src/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/peak-guard.mjs",
+        "to": "peak-guard.mjs"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      }
     ],
     "npmRebuild": false,
     "buildDependenciesFromSource": false,

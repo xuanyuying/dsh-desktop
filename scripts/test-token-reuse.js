@@ -1,4 +1,6 @@
 // 验证 token URL 的可重复使用性 + 新会话按钮存在性
+//
+// 说明：ensureHarnessRunning() 不再结束占用端口的进程（端口冲突时退让到空闲端口）。
 const http = require('node:http');
 const harness = require('../src/lib/harness');
 

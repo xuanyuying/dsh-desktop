@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    />
+    <title>DSH Desktop 设置</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 18px 20px;
+        background: #0d1117;
+        color: #e6edf3;
+        font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 4px;
+      }
+      .muted {
+        color: #8b949e;
+      }
+      .row {
+        margin: 14px 0;
+      }
+      label {
+        display: block;
+        margin-bottom: 5px;
+        color: #8b949e;
+      }
+      .field {
+        display: flex;
+        gap: 8px;
+      }
+      input[type='password'],
+      input[type='text'] {
+        flex: 1;
+        padding: 7px 10px;
+        border-radius: 7px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        background: #161b22;
+        color: #e6edf3;
+        font-family: inherit;
+        font-size: 13px;
+      }
+      button {
+        padding: 7px 14px;
+        border-radius: 7px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        background: #21262d;
+        color: #e6edf3;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 13px;
+      }
+      button.primary {
+        background: #1f6feb;
+        border-color: #1f6feb;
+      }
+      button:hover {
+        filter: brightness(1.15);
+      }
+      .checks label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: #e6edf3;
+        margin: 6px 0;
+      }
+      .status {
+        padding: 9px 12px;
+        border-radius: 8px;
+        background: #161b22;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .msg {
+        margin-top: 10px;
+        min-height: 18px;
+      }
+      .ok {
+        color: #3fb950;
+      }
+      .err {
+        color: #f85149;
+      }
+      .warn {
+        color: #d29922;
+      }
+      code {
+        background: #161b22;
+        padding: 1px 5px;
+        border-radius: 4px;
+      }
+      hr {
+        border: none;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        margin: 16px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>DSH Desktop 设置</h1>
+    <div class="muted" id="version">—</div>
+
+    <hr />
+
+    <div class="row">
+      <label>DeepSeek API Key（用于查询账户余额）</label>
+      <div class="field">
+        <input id="key" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false" />
+        <button id="toggle" title="显示/隐藏">显示</button>
+        <button id="save" class="primary">保存</button>
+      </div>
+      <div class="muted" style="margin-top: 6px">
+        保存后由系统加密存储（Windows DPAPI）。已配置的 Key 不会被回读显示。
+      </div>
+    </div>
+
+    <div class="row status" id="keyStatus">读取中…</div>
+    <div class="msg" id="msg"></div>
+
+    <hr />
+
+    <div class="checks">
+      <label><input type="checkbox" id="autoLaunch" /> 开机自动启动</label>
+      <label><input type="checkbox" id="minTray" /> 关闭窗口时最小化到托盘（而不是退出）</label>
+    </div>
+
+    <hr />
+
+    <div class="row" style="display: flex; gap: 8px">
+      <button id="openConfig">打开配置文件位置</button>
+      <button id="close">关闭</button>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      function setMsg(text, cls) {
+        const el = $('msg');
+        el.textContent = text || '';
+        el.className = 'msg ' + (cls || '');
+      }
+
+      async function refresh() {
+        let s = {};
+        try {
+          s = (await window.dshPanel.status()) || {};
+        } catch (e) {
+          setMsg('无法读取设置状态: ' + e.message, 'err');
+        }
+        $('version').textContent =
+          '版本 ' + (s.version || '?') + (s.safeMode ? '（安全模式）' : '');
+
+        const src = s.apiKeySource;
+        let html;
+        if (!src) {
+          html =
+            '<span class="warn">● 未配置 API Key</span> —— 右下角余额将显示「不可用」。设置后会立即生效。';
+        } else if (src === 'env:DEEPSEEK_API_KEY') {
+          html =
+            '<span class="ok">● 已配置</span>，来源：环境变量 <code>DEEPSEEK_API_KEY</code>（优先于本文件）';
+        } else if (src === 'config:encrypted') {
+          html = '<span class="ok">● 已配置</span>，来源：配置文件（<b>已加密</b>）';
+        } else if (src === 'config:plaintext') {
+          html =
+            '<span class="warn">● 已配置</span>，来源：配置文件（<b>明文</b>）。建议在这里重新保存一次以启用加密。';
+        } else {
+          html = '<span class="ok">● 已配置</span>，来源：Harness 凭据文件';
+        }
+        if (!s.encrypted) {
+          html += '<br /><span class="warn">当前环境系统加密不可用，保存将写入明文。</span>';
+        }
+        $('keyStatus').innerHTML = html;
+
+        $('autoLaunch').checked = s.autoLaunch === true;
+        $('minTray').checked = s.minimizeToTray === true;
+      }
+
+      $('toggle').addEventListener('click', () => {
+        const input = $('key');
+        const showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        $('toggle').textContent = showing ? '显示' : '隐藏';
+      });
+
+      $('save').addEventListener('click', async () => {
+        const value = $('key').value.trim();
+        if (!value) {
+          setMsg('请先填入 API Key', 'err');
+          return;
+        }
+        setMsg('保存中…', 'muted');
+        let r;
+        try {
+          r = await window.dshPanel.saveKey(value);
+        } catch (e) {
+          setMsg('保存失败: ' + e.message, 'err');
+          return;
+        }
+        if (r && r.ok) {
+          $('key').value = '';
+          setMsg(r.encrypted ? '已加密保存 ✓' : '已保存（明文）✓', 'ok');
+          await refresh();
+        } else {
+          setMsg('保存失败: ' + ((r && r.error) || '未知错误'), 'err');
+        }
+      });
+
+      $('autoLaunch').addEventListener('change', async (e) => {
+        await window.dshPanel.setAutoLaunch(e.target.checked);
+        await refresh();
+      });
+
+      $('minTray').addEventListener('change', async (e) => {
+        await window.dshPanel.setMinimizeToTray(e.target.checked);
+        await refresh();
+      });
+
+      $('openConfig').addEventListener('click', async () => {
+        const r = await window.dshPanel.openConfig();
+        setMsg(r && r.ok ? '已打开：' + r.path : '打开失败：' + ((r && r.error) || ''), r && r.ok ? 'ok' : 'err');
+      });
+
+      $('close').addEventListener('click', () => window.dshPanel.close());
+
+      refresh();
+    </script>
+  </body>
+</html>

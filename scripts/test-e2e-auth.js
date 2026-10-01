@@ -4,6 +4,9 @@
  * 2. 用 token URL 认证（303 + cookie）
  * 3. 带 cookie 访问页面（应 200 + 含 React root）
  * 用法: node scripts/test-e2e-auth.js
+ *
+ * 说明：ensureHarnessRunning() 不再结束占用端口的进程（端口冲突时退让到
+ * 空闲端口）。若本机 3080 已有服务，本测试会另起一个实例并在结束时清理。
  */
 'use strict';
 

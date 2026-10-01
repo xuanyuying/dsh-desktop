@@ -7,14 +7,37 @@
  */
 'use strict';
 
-const { app, BrowserWindow, ipcMain, shell, dialog, session } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  shell,
+  dialog,
+  session,
+  screen,
+  Tray,
+  Menu,
+  nativeImage,
+  safeStorage,
+} = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
+const { spawn } = require('node:child_process');
 
 const harness = require('./lib/harness');
 const balance = require('./lib/balance');
-const { setupMenu } = require('./menu');
+const peakLib = require('./lib/peak');
+const peakDesktop = require('./lib/peak-desktop');
+const uiState = require('./lib/ui-state');
+const updater = require('./lib/updater');
+const { setupMenu, updatePeakMenu } = require('./menu');
+
+/**
+ * 安全模式：跳过托盘、自启等与窗口管理耦合的功能，
+ * 只保留「启动服务 + 加载界面」。启动异常时可用来快速恢复。
+ */
+const SAFE_MODE = process.env.DSH_DESKTOP_SAFE === '1';
 
 // ---------------------------------------------------------------------------
 // File logging（便于诊断 GUI 问题：渲染错误、认证、WebSocket）
@@ -103,7 +126,20 @@ if (!gotLock) {
 let balanceTimer = null;
 let apiKey = null;
 
+/**
+ * 窗口是否处于可见状态。
+ * 最小化到托盘 / 隐藏时不该继续打余额接口，省流量也省额度查询。
+ */
+function isWindowVisible() {
+  try {
+    return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible());
+  } catch {
+    return false;
+  }
+}
+
 async function refreshBalance() {
+  if (!isWindowVisible()) return;
   const data = await balance.getBalanceData(apiKey);
   pushBalance(data);
 }
@@ -117,7 +153,11 @@ function pushBalance(data) {
 function startBalancePolling() {
   if (balanceTimer) clearInterval(balanceTimer);
   refreshBalance();
-  balanceTimer = setInterval(refreshBalance, BALANCE_REFRESH_MS);
+  balanceTimer = setInterval(() => {
+    // 隐藏时跳过；重新显示后下一次 tick 会自动补上
+    if (!isWindowVisible()) return;
+    refreshBalance();
+  }, BALANCE_REFRESH_MS);
 }
 
 function stopBalancePolling() {
@@ -125,6 +165,156 @@ function stopBalancePolling() {
     clearInterval(balanceTimer);
     balanceTimer = null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 峰谷时段（DeepSeek 官方高峰/空闲计价）
+//
+// 显示：空闲 / 高峰 + 倒计时 + 折扣
+// 限制：高峰时段零 token —— 由随应用分发的 Cordis 守卫插件在 harness 侧
+//       短路 `llm/stream`（不调用 next()，请求根本不会发出）实现。
+//       渲染层只做体验拦截，真正的保证在插件；因此这里必须校验插件存活，
+//       否则「零消耗」只是空头承诺（例如复用了未注入守卫的既有服务）。
+// ---------------------------------------------------------------------------
+
+const PEAK_POLL_MS = 30 * 1000;
+let peakTimer = null;
+let guardInjected = false;
+let guardAlive = false;
+
+/** 定位随应用分发的守卫插件 */
+function getGuardPluginPath() {
+  return peakDesktop.resolveGuardPluginPath({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appDir: __dirname,
+  });
+}
+
+/**
+ * 启动 harness 之前：生成 patch 与控制文件，并交给 harness 模块拼进启动参数。
+ * @returns {boolean} 是否成功注入
+ */
+function setupPeakGuard() {
+  try {
+    const guard = getGuardPluginPath();
+    if (!guard) {
+      logToFile('[peak] 未找到守卫插件 peak-guard.mjs，零 token 保护不可用');
+      return false;
+    }
+    peakDesktop.ensureControlFile();
+    // 清掉上次运行留下的心跳，避免把旧状态误判为「守卫存活」
+    peakDesktop.clearStatus();
+    const patch = peakDesktop.writePatchFile(guard);
+    harness.setExtraPatches([patch]);
+    guardInjected = true;
+    logToFile('[peak] 已注入峰谷守卫: ' + guard);
+    return true;
+  } catch (e) {
+    logToFile('[peak] 注入守卫失败: ' + e.message);
+    guardInjected = false;
+    return false;
+  }
+}
+
+/** 组装推送给渲染进程的峰谷状态（组装逻辑在纯模块里，便于单测） */
+function buildPeakPayload() {
+  const payload = peakDesktop.buildPayload({
+    harnessRunning: harness.startedByUs ? 'self' : 'external',
+  });
+  guardAlive = payload.guardAlive;
+  return { ...payload, guardInjected };
+}
+
+function pushPeak() {
+  const payload = buildPeakPayload();
+  try {
+    updatePeakMenu(payload);
+  } catch (e) {
+    logToFile('[peak] 更新菜单失败: ' + e.message);
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('peak:update', payload);
+  }
+  return payload;
+}
+
+function startPeakPolling() {
+  if (peakTimer) clearInterval(peakTimer);
+  pushPeak();
+  // 渲染层自行每秒倒计时；这里只需周期刷新守卫存活与开关状态
+  peakTimer = setInterval(() => {
+    if (!isWindowVisible()) return; // 隐藏时不必刷新
+    const payload = pushPeak();
+    // 守卫未生效时给出明确告警，避免「零消耗」变成空头承诺
+    if (payload.isPeak && payload.guardEnabled && !payload.guardAlive) {
+      logToFile('[peak] 警告：高峰时段守卫未生效（心跳缺失或过期），无法保证零消耗');
+    }
+  }, PEAK_POLL_MS);
+}
+
+function stopPeakPolling() {
+  if (peakTimer) {
+    clearInterval(peakTimer);
+    peakTimer = null;
+  }
+}
+
+/** 临时放行至本时段结束（跨过下一个切换点即自动恢复拦截） */
+function allowPeakTemporarily() {
+  const s = peakLib.getPeakState();
+  const until = s.nextChangeAt ? s.nextChangeAt.getTime() : Date.now() + 60 * 60 * 1000;
+  peakDesktop.writeControl({ allowUntilMs: until });
+  logService('peak: 临时放行至 ' + new Date(until).toLocaleString());
+  pushPeak();
+  return buildPeakPayload();
+}
+
+/** 开关高峰守卫 */
+function setPeakGuard(enabled) {
+  peakDesktop.writeControl({ enabled: !!enabled, allowUntilMs: 0 });
+  logService('peak: 守卫已' + (enabled ? '开启' : '关闭'));
+  pushPeak();
+  return buildPeakPayload();
+}
+
+/** 菜单：显示当前峰谷状态 */
+function menuShowPeakStatus() {
+  const p = buildPeakPayload();
+  const guard = !p.guardEnabled
+    ? '已关闭（高峰会正常消耗 token）'
+    : p.isPeak
+      ? p.allowed
+        ? '已临时放行（高峰会正常消耗 token）'
+        : p.guardAlive
+          ? '运行中 —— 高峰不消耗任何 token'
+          : '⚠ 未生效 —— 请用「重启服务」使守卫加载'
+      : p.guardAlive
+        ? '待命（进入高峰自动拦截）'
+        : '⚠ 未生效 —— 请用「重启服务」使守卫加载';
+
+  dialog.showMessageBox(mainWindow, {
+    type: p.isPeak && p.guardEnabled && !p.allowed && !p.guardAlive ? 'warning' : 'info',
+    title: '峰谷时段',
+    message: p.periodLabel + ' · ' + p.discountLabel,
+    detail:
+      p.countdownText + '\n\n' +
+      '高峰（本机时间，周一至周五）：' + (p.localPeakWindows.join('、') || '—') + '\n' +
+      '官方规则：' + p.rule + '\n\n' +
+      '零 token 守卫：' + guard +
+      (p.isPeak && p.guardEnabled && !p.allowed && !p.guardAlive
+        ? '\n\n当前无法确认零消耗保护生效。若刚开启功能，请在菜单「峰谷时段 → 重启服务以启用保护」。'
+        : ''),
+    buttons: ['确定'],
+  });
+}
+
+/** 菜单：重启服务以加载/更新守卫 */
+async function menuRestartForPeakGuard() {
+  // 清掉旧心跳：否则重启后的空窗期内会把上一次的存活状态当成有效
+  peakDesktop.clearStatus();
+  await menuRestartService();
+  pushPeak();
 }
 
 // ---------------------------------------------------------------------------
@@ -136,14 +326,37 @@ let pageLoadRetry = 0;
 let pageReady = false;
 let pageWatchTimer = null;
 
+/**
+ * 主框架允许导航到的地址：启动占位页 + 当前 harness 基址。
+ * 其余一律拦截并交给系统浏览器，避免外部站点在应用窗口内加载。
+ */
+function isAllowedNavigation(url) {
+  const u = String(url || '');
+  if (u === 'about:blank' || u.startsWith('data:')) return true;
+  try {
+    const base = harness.HARNESS_URL;
+    return u === base + '/' || u.startsWith(base + '/') || u.startsWith(base + '?');
+  } catch {
+    return false;
+  }
+}
+
 function createMainWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) return;
 
+  // 尺寸按当前显示器工作区收敛（写死 1440×900 在 1440×900 屏幕上会被任务栏裁掉底部）
+  let bounds = { width: uiState.DEFAULT_WINDOW.width, height: uiState.DEFAULT_WINDOW.height };
+  try {
+    const wa = screen.getPrimaryDisplay().workArea;
+    bounds = uiState.clampBounds(uiState.loadState().window, wa);
+  } catch (e) {
+    logToFile('[window] 读取工作区失败，使用默认尺寸: ' + e.message);
+  }
+
   mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 900,
-    minWidth: 960,
-    minHeight: 640,
+    ...bounds,
+    minWidth: uiState.MIN_WINDOW.width,
+    minHeight: uiState.MIN_WINDOW.height,
     title: 'DeepSeek Harness Desktop',
     autoHideMenuBar: false, // 显示顶部菜单栏
     backgroundColor: '#0d1117',
@@ -151,9 +364,18 @@ function createMainWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      // preload 只用 electron IPC 与 DOM，不需要 Node，因此可以开沙箱
+      sandbox: true,
     },
   });
+
+  if (uiState.loadState().window && uiState.loadState().window.maximized) {
+    try {
+      mainWindow.maximize();
+    } catch {
+      /* 忽略 */
+    }
+  }
 
   // 窗口秒开：先显示启动提示页（等服务就绪后再加载真实界面）
   loadLoadingPage();
@@ -161,6 +383,63 @@ function createMainWindow() {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('http')) shell.openExternal(url);
     return { action: 'deny' };
+  });
+
+  // 主框架导航白名单：只允许 harness 自身与启动占位页。
+  // 没有这道防线时，页面里的普通链接会把外部站点加载进应用窗口，
+  // 而 preload 仍然挂在上面。
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isAllowedNavigation(url)) return;
+    event.preventDefault();
+    logToFile('[nav] 已拦截站外导航: ' + String(url).slice(0, 200));
+    if (/^https?:/i.test(url)) shell.openExternal(url);
+  });
+
+  // 记录窗口位置/大小（防抖，避免拖动时频繁写盘）
+  let saveTimer = null;
+  const scheduleSaveBounds = () => {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      try {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        const isMax = mainWindow.isMaximized();
+        const b = isMax ? uiState.loadState().window : mainWindow.getBounds();
+        uiState.saveState({
+          window: {
+            x: b && Number.isFinite(b.x) ? b.x : undefined,
+            y: b && Number.isFinite(b.y) ? b.y : undefined,
+            width: b && Number.isFinite(b.width) ? b.width : bounds.width,
+            height: b && Number.isFinite(b.height) ? b.height : bounds.height,
+            maximized: isMax,
+          },
+        });
+      } catch {
+        /* 忽略 */
+      }
+    }, 500);
+  };
+  mainWindow.on('resize', scheduleSaveBounds);
+  mainWindow.on('move', scheduleSaveBounds);
+  mainWindow.on('maximize', scheduleSaveBounds);
+  mainWindow.on('unmaximize', scheduleSaveBounds);
+
+  // 关闭行为：默认退出；若用户勾选了「最小化到托盘」则隐藏到托盘
+  mainWindow.on('close', (event) => {
+    if (appQuitting || SAFE_MODE || !tray || !isMinimizeToTray()) return;
+    event.preventDefault();
+    mainWindow.hide();
+    logToFile('[window] 已最小化到托盘');
+  });
+
+  // 重新显示时立即补一次数据（隐藏期间轮询是跳过的）
+  mainWindow.on('show', () => {
+    try {
+      pushPeak();
+    } catch {
+      /* 忽略 */
+    }
+    refreshBalance().catch(() => {});
   });
 
   // 捕获渲染进程 console（React/WebSocket/fetch 错误都在这里），写入日志文件
@@ -597,6 +876,19 @@ function initMenu() {
     openInBrowser: menuOpenInBrowser,
     openLogFile: menuOpenLogFile,
     showAbout: menuShowAbout,
+    showPeakStatus: menuShowPeakStatus,
+    restartForPeakGuard: menuRestartForPeakGuard,
+    setPeakGuard,
+    allowPeakTemporarily,
+    getPeakPayload: buildPeakPayload,
+    checkDesktopUpdate,
+    openSettings: openSettingsWindow,
+    openLogs: openLogsWindow,
+    kickPortOwner,
+    toggleMinimizeToTray,
+    isMinimizeToTray,
+    setAutoLaunch,
+    isAutoLaunchEnabled,
   });
 }
 
@@ -672,6 +964,317 @@ function logService(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// 托盘 / 自启 / 面板窗口 / 应用内更新
+// ---------------------------------------------------------------------------
+
+let tray = null;
+let settingsWindow = null;
+let logsWindow = null;
+/** 真正退出（区别于关闭窗口隐藏到托盘） */
+let appQuitting = false;
+
+/** 托盘/面板用的应用图标（打包后在 resources/，开发时在 build/） */
+function resolveIconPath() {
+  const candidates = [];
+  if (app.isPackaged && process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, 'icon.png'));
+  }
+  candidates.push(path.join(__dirname, '..', 'build', 'icon.png'));
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) return c;
+    } catch {
+      /* 继续 */
+    }
+  }
+  return null;
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+/** 是否启用「关闭时最小化到托盘」（默认关闭，保持关闭即退出的直觉） */
+function isMinimizeToTray() {
+  return uiState.loadState().minimizeToTray === true;
+}
+
+function createTray() {
+  if (SAFE_MODE || tray) return;
+  try {
+    const iconPath = resolveIconPath();
+    let img = iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
+    if (img.isEmpty()) img = nativeImage.createFromPath(process.execPath);
+    if (img.isEmpty()) {
+      logToFile('[tray] 找不到可用图标，跳过托盘');
+      return;
+    }
+    tray = new Tray(img.resize({ width: 16, height: 16 }));
+    tray.setToolTip('DSH Desktop');
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: '显示主窗口', click: () => showMainWindow() },
+        { label: '隐藏主窗口', click: () => mainWindow && mainWindow.hide() },
+        { type: 'separator' },
+        { label: '峰谷时段状态…', click: () => menuShowPeakStatus() },
+        { label: '打开日志…', click: () => openLogsWindow() },
+        { type: 'separator' },
+        {
+          label: '退出 DSH Desktop',
+          click: () => {
+            appQuitting = true;
+            shutdownApp();
+          },
+        },
+      ])
+    );
+    tray.on('click', () => {
+      if (mainWindow && mainWindow.isVisible() && !mainWindow.isMinimized()) {
+        mainWindow.hide();
+      } else {
+        showMainWindow();
+      }
+    });
+    logToFile('[tray] 已创建');
+  } catch (e) {
+    logToFile('[tray] 创建失败: ' + e.message);
+  }
+}
+
+function isAutoLaunchEnabled() {
+  try {
+    return app.getLoginItemSettings().openAtLogin === true;
+  } catch {
+    return false;
+  }
+}
+
+function setAutoLaunch(enabled) {
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: !!enabled,
+      path: process.execPath,
+      args: [],
+    });
+    logToFile('[autolaunch] ' + (enabled ? '已开启' : '已关闭'));
+  } catch (e) {
+    logToFile('[autolaunch] 设置失败: ' + e.message);
+    dialog.showErrorBox('设置开机自启失败', String(e && e.message));
+  }
+  return isAutoLaunchEnabled();
+}
+
+/** 面板窗口通用创建 */
+function createPanelWindow(kind) {
+  const isSettings = kind === 'settings';
+  const existing = isSettings ? settingsWindow : logsWindow;
+  if (existing && !existing.isDestroyed()) {
+    existing.show();
+    existing.focus();
+    return existing;
+  }
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+  const win = new BrowserWindow({
+    width: isSettings ? 560 : 940,
+    height: isSettings ? 320 : 620,
+    parent,
+    title: isSettings ? 'DSH Desktop 设置' : 'DSH Desktop 日志',
+    backgroundColor: '#0d1117',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'panel-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  win.loadFile(path.join(__dirname, isSettings ? 'settings.html' : 'logs.html'));
+  win.on('closed', () => {
+    if (isSettings) settingsWindow = null;
+    else logsWindow = null;
+  });
+  if (isSettings) settingsWindow = win;
+  else logsWindow = win;
+  return win;
+}
+
+function openSettingsWindow() {
+  try {
+    createPanelWindow('settings');
+  } catch (e) {
+    logToFile('[panel] 打开设置窗口失败: ' + e.message);
+  }
+}
+
+function openLogsWindow() {
+  try {
+    createPanelWindow('logs');
+  } catch (e) {
+    logToFile('[panel] 打开日志窗口失败: ' + e.message);
+  }
+}
+
+/** 读取日志尾部 */
+function readLogTail(maxBytes = 256 * 1024) {
+  try {
+    const st = fs.statSync(getLogFilePath());
+    const start = Math.max(0, st.size - maxBytes);
+    const fd = fs.openSync(getLogFilePath(), 'r');
+    const buf = Buffer.alloc(st.size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    fs.closeSync(fd);
+    return buf.toString('utf8');
+  } catch (e) {
+    return '(无法读取日志: ' + e.message + ')';
+  }
+}
+
+/** 检查 DSH Desktop 自身更新（与应用内下载安装） */
+async function checkDesktopUpdate() {
+  const local = app.getVersion();
+  logService('checking DSH Desktop update, local=' + local);
+
+  const r = await updater.fetchLatestRelease();
+  if (!r.ok) {
+    dialog.showMessageBox(mainWindow, {
+      type: 'error',
+      title: '检查更新失败',
+      message: '无法访问 GitHub Releases',
+      detail: String(r.error || '未知错误') + '\n\n请检查网络或代理设置。',
+      buttons: ['确定'],
+    });
+    return;
+  }
+
+  const rel = r.release;
+  if (!updater.isNewer(local, rel.version)) {
+    dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      title: '检查更新',
+      message: '已是最新版本',
+      detail: '当前版本 ' + local + '，线上最新 ' + rel.version + '。',
+      buttons: ['确定'],
+    });
+    return;
+  }
+
+  const pick = await dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '发现新版本',
+    message: 'DSH Desktop ' + rel.version + ' 可用（当前 ' + local + '）',
+    detail: (rel.notes || '(无更新说明)').slice(0, 800),
+    buttons: ['下载并安装', '在浏览器中打开', '稍后'],
+    defaultId: 0,
+    cancelId: 2,
+  });
+  if (pick.response === 1) {
+    if (rel.htmlUrl) shell.openExternal(rel.htmlUrl);
+    return;
+  }
+  if (pick.response !== 0) return;
+
+  if (!rel.installer || !rel.installer.url) {
+    dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: '无法自动更新',
+      message: '该版本没有提供可下载的安装包',
+      detail: '请前往 Releases 页面手动下载。',
+      buttons: ['确定'],
+    });
+    return;
+  }
+
+  const dir = path.join(app.getPath('temp'), 'dsh-desktop-update');
+  const dest = updater.installerPath(dir, rel.version, rel.installer.name);
+  logService('downloading ' + rel.installer.url + ' → ' + dest);
+
+  let lastLogged = 0;
+  const res = await updater.downloadFile(rel.installer.url, dest, {
+    onProgress: (received, total) => {
+      if (total > 0 && received - lastLogged > 5 * 1024 * 1024) {
+        lastLogged = received;
+        logService(
+          'download ' + Math.round((received / total) * 100) + '% (' + received + '/' + total + ')'
+        );
+      }
+    },
+  });
+
+  if (!res.ok) {
+    dialog.showMessageBox(mainWindow, {
+      type: 'error',
+      title: '下载失败',
+      message: '安装包下载失败',
+      detail: String(res.error || '') + '\n\n也可前往 Releases 页面手动下载。',
+      buttons: ['确定'],
+    });
+    return;
+  }
+
+  const go = await dialog.showMessageBox(mainWindow, {
+    type: 'question',
+    title: '下载完成',
+    message: '是否立即安装 DSH Desktop ' + rel.version + '？',
+    detail:
+      '安装程序会先退出 DSH Desktop，安装完成后自动重新打开。\n文件：' + dest,
+    buttons: ['立即安装', '稍后'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (go.response !== 0) return;
+
+  try {
+    appQuitting = true;
+    spawn(dest, [], { detached: true, stdio: 'ignore' }).unref();
+    logService('launched installer, quitting');
+  } catch (e) {
+    logService('launch installer failed: ' + e.message);
+    dialog.showErrorBox('启动安装程序失败', String(e && e.message) + '\n\n请手动运行：' + dest);
+    return;
+  }
+  shutdownApp();
+}
+
+/** 菜单：结束占用端口的 dsh web 进程（需用户明确确认） */
+async function kickPortOwner() {
+  const port = harness.HARNESS_PORT;
+  const ask = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    title: '结束占用端口的进程',
+    message: '结束占用端口 ' + port + ' 的 dsh web 服务？',
+    detail:
+      '只会结束命令行确认为 dsh web 的进程。\n' +
+      '请注意：如果那正是你当前正在使用的会话，它会被中断。\n\n' +
+      '（应用默认不会自动做这件事，端口冲突时它会改用其它端口。）',
+    buttons: ['结束进程', '取消'],
+    defaultId: 1,
+    cancelId: 1,
+  });
+  if (ask.response !== 0) return;
+  const killed = harness.killDshWebOnPort(port);
+  dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '结果',
+    message: killed ? '已结束占用端口 ' + port + ' 的 dsh web 进程' : '未找到可结束的 dsh web 进程',
+    detail: killed ? '重启应用即可在首选端口上启动服务。' : '占用该端口的可能是其它程序。',
+    buttons: ['确定'],
+  });
+}
+
+/** 菜单：切换「关闭时最小化到托盘」 */
+function toggleMinimizeToTray(enabled) {
+  uiState.saveState({ minimizeToTray: !!enabled });
+  logService('minimizeToTray=' + !!enabled);
+  return !!enabled;
+}
+
+// ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
 
@@ -684,7 +1287,80 @@ ipcMain.handle('app:info', () => ({
 
 ipcMain.handle('balance:refresh', () => refreshBalance());
 
+ipcMain.handle('peak:refresh', () => buildPeakPayload());
+ipcMain.handle('peak:allow-temporarily', () => allowPeakTemporarily());
+ipcMain.handle('peak:set-guard', (_e, enabled) => setPeakGuard(enabled));
+
+// --- HUD 位置：改由主进程落盘，端口变化或重装都不会丢 ---
+// 用同步通道读取，避免启动时先渲染在默认位置再"跳"一下
+ipcMain.on('ui:get-hud', (e) => {
+  e.returnValue = uiState.loadHud();
+});
+ipcMain.handle('ui:set-hud', (_e, hud) => uiState.saveHud(hud || {}));
+
+// --- 设置面板 ---
+ipcMain.handle('settings:status', () => ({
+  apiKeyConfigured: !!balance.resolveApiKey(),
+  // 只回传是否配置与来源，绝不回传密钥本身
+  apiKeySource: balance.describeApiKeySource(),
+  encrypted: balance.isEncryptedKeyAvailable(),
+  configPath: balance.configFilePath(),
+  version: app.getVersion(),
+  autoLaunch: isAutoLaunchEnabled(),
+  minimizeToTray: isMinimizeToTray(),
+  safeMode: SAFE_MODE,
+}));
+ipcMain.handle('settings:save-key', async (_e, value) => {
+  // 优先用系统加密存储；不可用时退回明文（与旧配置兼容）
+  let encrypt;
+  try {
+    if (safeStorage.isEncryptionAvailable()) {
+      encrypt = (s) => safeStorage.encryptString(s);
+    }
+  } catch {
+    /* 退回明文 */
+  }
+  const r = balance.saveApiKey(String(value || ''), encrypt);
+  if (r.ok) {
+    apiKey = balance.resolveApiKey();
+    refreshBalance().catch(() => {});
+    pushPeak();
+  }
+  return r;
+});
+ipcMain.handle('settings:set-auto-launch', (_e, enabled) => setAutoLaunch(enabled));
+ipcMain.handle('settings:set-minimize-to-tray', (_e, enabled) => toggleMinimizeToTray(enabled));
+ipcMain.handle('settings:open-config', () => {
+  try {
+    const p = balance.configFilePath();
+    balance.ensureConfigFile();
+    shell.showItemInFolder(p);
+    return { ok: true, path: p };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// --- 日志面板 ---
+ipcMain.handle('logs:read', () => ({
+  path: getLogFilePath(),
+  text: readLogTail(),
+}));
+ipcMain.handle('logs:clear', () => {
+  try {
+    fs.writeFileSync(getLogFilePath(), '');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+ipcMain.handle('logs:open-folder', () => {
+  shell.showItemInFolder(getLogFilePath());
+  return { ok: true };
+});
+
 ipcMain.on('app:quit', () => {
+  appQuitting = true;
   shutdownApp();
 });
 
@@ -693,10 +1369,32 @@ ipcMain.on('app:quit', () => {
 // ---------------------------------------------------------------------------
 
 async function bootstrap() {
+  // 0. 加密适配器 + 首次运行创建配置文件（此前只能靠用户照报错手动创建）
+  try {
+    if (safeStorage.isEncryptionAvailable()) {
+      balance.setDecryptAdapter((buf) => safeStorage.decryptString(buf));
+    } else {
+      logService('系统加密不可用，API Key 将以明文保存');
+    }
+  } catch (e) {
+    logService('初始化加密适配器失败: ' + e.message);
+  }
+  try {
+    balance.ensureConfigFile();
+  } catch {
+    /* 忽略 */
+  }
+
   apiKey = balance.resolveApiKey();
 
   // 0. 初始化菜单栏
   initMenu();
+
+  // 0.5 峰谷守卫：必须在启动 harness 之前注入，否则服务不会加载插件
+  setupPeakGuard();
+
+  // 0.6 托盘（失败不影响主流程）
+  createTray();
 
   // 1. 窗口秒开（显示启动提示页）
   createMainWindow();
@@ -708,6 +1406,13 @@ async function bootstrap() {
     const state = result && result.started ? 'launched' : 'reused';
     const tokenState = result && result.authUrl ? 'token captured' : 'no token needed';
     logService('dsh web service ' + state + ' (' + tokenState + ')');
+    // 以 harness 的真实结果为准：兜底重试可能去掉了 --patch
+    if (result && result.started) guardInjected = harness.guardPatchesApplied;
+    if (result && result.reused && !peakDesktop.isGuardAlive(peakDesktop.readStatus())) {
+      logService(
+        'peak: 复用的服务未运行峰谷守卫 —— 高峰零消耗无法保证；如需保护请在菜单「峰谷时段 → 重启服务以启用保护」'
+      );
+    }
   } catch (err) {
     logService('service launch error: ' + err.message);
   }
@@ -717,12 +1422,23 @@ async function bootstrap() {
     loadMainPage();
   }
 
-  // 4. 余额轮询
+  // 4. 余额与峰谷轮询
   startBalancePolling();
+  startPeakPolling();
 }
 
 function shutdownApp() {
+  appQuitting = true;
   stopBalancePolling();
+  stopPeakPolling();
+  try {
+    if (tray && !tray.isDestroyed()) {
+      tray.destroy();
+      tray = null;
+    }
+  } catch {
+    /* 忽略 */
+  }
   const stopped = harness.stopHarnessIfOwned();
   if (stopped) logService('closed dsh service launched by app');
   app.quit();

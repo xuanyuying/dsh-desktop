@@ -1,8 +1,8 @@
 # DeepSeek Harness 桌面版 (DSH Desktop)
 
-一个基于 **Electron** 的 Windows 桌面应用，用于启动并承载 **DeepSeek Harness** 的完整 Web 界面（对话、插件、技能、工作流、子代理、设置等全部功能），并在窗口**右下角实时显示 DeepSeek 账户余额**。
+一个基于 **Electron** 的 Windows 桌面应用，用于启动并承载 **DeepSeek Harness** 的完整 Web 界面（对话、插件、技能、工作流、子代理、设置等全部功能），并在右上角实时显示**峰谷计价时段**与 **DeepSeek 账户余额**。
 
-![技术栈](https://img.shields.io/badge/Electron-43-blue) ![平台](https://img.shields.io/badge/Windows-Win10%2B-brightgreen) ![License](https://img.shields.io/badge/License-MIT-green) ![Release](https://img.shields.io/github/v/release/xuanyuying/dsh-desktop)
+![技术栈](https://img.shields.io/badge/Electron-43-blue) ![平台](https://img.shields.io/badge/Windows-Win10%2B-brightgreen) ![License](https://img.shields.io/badge/License-MIT-green) ![Release](https://img.shields.io/github/v/release/xuanyuying/dsh-desktop) ![CI](https://github.com/xuanyuying/dsh-desktop/actions/workflows/ci.yml/badge.svg)
 
 > 💡 **通用版**：不含任何个人 API Key，开箱即用，配置你自己的 Key 即可。
 > 💡 **无需 Visual Studio / 任何 IDE**：Node.js + Electron，命令行即可运行、测试、打包。
@@ -13,13 +13,55 @@
 ## ✨ 功能特性
 
 ### 🖥️ 桌面集成
-- **标准菜单栏**：文件 / 编辑 / 视图 / 工具 / 帮助 五段式菜单，符合 Windows 桌面软件习惯
-  - 文件：新建会话（Ctrl+N）、刷新界面（Ctrl+R）、在浏览器打开、打开配置目录、退出
+- **标准菜单栏**：文件 / 编辑 / 视图 / 工具 / 峰谷 / 帮助 六段式菜单，符合 Windows 桌面软件习惯
+  - 文件：新建会话（Ctrl+N）、刷新界面（Ctrl+R）、在浏览器打开、打开配置目录、**设置…（Ctrl+,）**、退出
   - 编辑：撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选
-  - 视图：重新加载（F5）、强制重载、缩放、全屏（F11）、开发者工具（F12）
-  - 工具：**检查 dsh 更新**、重启 dsh 服务、查看服务状态
-  - 帮助：官方文档、项目主页、反馈问题、关于
-- **快捷键**：Ctrl+N 新建会话、F5 刷新、F11 全屏、F12 开发者工具
+  - 视图：重新加载（F5）、强制重载、缩放、全屏（F11）、开发者工具（F12）、**关闭时最小化到托盘**、**开机自动启动**
+  - 工具：**检查 dsh 更新**、重启 dsh 服务、查看服务状态、打开日志、**内置日志查看器（Ctrl+Shift+L）**、**结束占用端口的服务**
+  - 峰谷：**实时时段与倒计时**、高峰零 token 开关、临时放行、时段详情、官方计价说明
+  - 帮助：官方文档、项目主页、反馈问题、**检查 DSH Desktop 更新**、关于
+- **快捷键**：Ctrl+N 新建会话、F5 刷新、F11 全屏、F12 开发者工具、Ctrl+, 设置
+- **托盘**：可最小化到系统托盘常驻；托盘菜单可显示/隐藏窗口、查看峰谷状态、打开日志、退出
+- **窗口记忆**：位置与大小持久化，且**按当前显示器工作区自动收敛** —— 在 1440×900 或 1366×768 等小屏上不会被任务栏裁掉底部输入区
+- **应用内更新**：菜单「帮助 → 检查 DSH Desktop 更新」直接查 GitHub Releases、下载安装包并一键安装（退出 → 安装 → 自动重开）
+
+### 🔐 安全与稳定
+- **端口冲突不再误杀**：首选端口（默认 3080）被其它服务占用时，应用**自动退让到下一个空闲端口**，绝不会结束别人正在使用的服务（也包括你自己正在跑的 harness）。确需清理时用菜单「工具 → 结束占用端口的服务」，且会二次确认
+- **导航白名单**：主框架只允许停留在 harness 自身地址，页面里的外部链接交给系统浏览器打开，不会把外部站点加载进应用窗口
+- **渲染进程沙箱**：`sandbox: true` + `contextIsolation: true` + `nodeIntegration: false`
+- **零 token 保证可验证**：守卫插件写心跳，界面据此判断保护是否真的生效（见下）
+- **安全模式**：设 `DSH_DESKTOP_SAFE=1` 启动可跳过托盘等窗口管理功能，仅保留「起服务 + 载界面」，用于异常时快速恢复
+
+### 🔑 API Key 与设置面板
+- 菜单「文件 → 设置…」图形化配置，**优先用系统加密存储**（Windows DPAPI / `safeStorage`），不再只能手工编辑 JSON
+- 首次运行自动创建 `~/.dsh-desktop/config.json`（此前只能照报错信息手动创建）
+- 已配置的 Key **不会被回读显示**；界面上只显示「是否已配置 + 来源 + 是否加密」
+- 解析优先级：环境变量 `DEEPSEEK_API_KEY` → 应用配置（加密或明文）→ Harness 凭据 `~/.dsh/credentials.yaml`
+
+### ⏰ 峰谷时段与「高峰零 token 消耗」
+
+按 DeepSeek 官方[峰谷计价规则](https://api-docs.deepseek.com/quick_start/pricing)在本地判定时段并强制执行：
+
+> **高峰 = 周一至周五 01:00–04:00 与 06:00–10:00（UTC）**，其余时间（含整个周末）为空闲时段；**空闲价 = 高峰价 5 折**。
+
+换算北京时间：高峰为**周一至周五 09:00–12:00 与 14:00–18:00**。应用按你本机时区实时换算，不只显示 UTC。
+
+**显示**：右上角紧凑小卡 + 菜单「峰谷」项，实时显示当前时段、折扣与**距离切换的倒计时**（🟢 空闲 / 🔴 高峰已暂停 / 🟠 已放行或守卫关闭）。悬停展开规则、本机高峰窗口与各模型价目。
+
+小卡**可拖动**（位置存主进程，端口变化或重装都不会丢）、**双击复位**、**点 − 折叠**，平时半透明不遮挡正文。
+
+**限制**：高峰时段**不消耗任何 token**。实现方式不是「发出请求后再取消」，而是在 harness 侧真正短路模型调用：
+
+- 应用启动 `dsh web` 时会用 `--patch` 注入一个随应用分发的 Cordis 插件 `peak-guard.mjs`
+- 该插件监听 `llm/stream`（**包裹每一次流式模型调用的 waterfall**），高峰时段**不调用 `next()`** —— 请求根本不会发往 DeepSeek，因此不产生任何 token 消耗，覆盖普通对话、子代理、工作流、Ralph、压缩等全部路径
+- 插件会周期性写出心跳，应用据此校验**保护是否真的生效**；若因复用既有服务等原因导致守卫未加载，界面与菜单会**明确告警**，而不是假装受保护
+- 需要临时工作时，菜单「峰谷 → 临时放行至本时段结束」，到点自动恢复拦截
+
+```powershell
+npm test          # 可独立运行的全部单测（227 断言，CI 也跑这一组）
+npm run test:e2e  # 端到端：真实启动 harness 验证守卫被加载并写出心跳
+npm run verify    # 开发机全量验证（含需要本机服务的用例）
+```
 
 ### 🚀 自动启动前提
 启动时自动完成，无需手动执行任何命令：
@@ -37,7 +79,7 @@
 
 ### 🔌 DeepSeek Harness 0.1.5+ 适配
 - **认证机制适配（关键）**：0.1.5 起 `dsh web` 需要认证，裸访问返回 401。本应用会捕获启动输出中的**带 token URL** 并用它加载界面（303 → cookie → 200），彻底解决黑屏
-- **端口冲突自愈**：若 3080 被无法认证的遗留服务占用，自动清理该 dsh web 进程并重启自己的服务
+- **端口冲突自动退让**：首选端口被无法认证的遗留服务占用时，自动改用下一个空闲端口启动自己的服务（**不会结束任何进程**）
 - **代理支持**：传递 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` 环境变量（0.1.5 新增）
 - 兼容 `--no-open` 官方参数（0.1.5 官方推荐用法）
 - 支持 0.1.5 新特性：DeepSeek-V41-Flash 模型、任意文件上传、右侧 Sidebar 预览
@@ -58,7 +100,7 @@ node scripts\doctor.js
 
 ## ⬇️ 下载安装
 
-前往 [Releases 页面](https://github.com/xuanyuying/dsh-desktop/releases) 下载 **`DSH Desktop Setup 1.2.1.exe`** 安装程序（Windows 10/11，约 95 MB）。
+前往 [Releases 页面](https://github.com/xuanyuying/dsh-desktop/releases) 下载 **`DSH Desktop Setup 1.4.0.exe`** 安装程序（Windows 10/11，约 95 MB）。
 
 或克隆源码自行构建：
 

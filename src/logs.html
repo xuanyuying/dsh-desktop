@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    />
+    <title>DSH Desktop 日志</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        background: #0d1117;
+        color: #e6edf3;
+        font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        font-size: 13px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        flex: 0 0 auto;
+      }
+      header .path {
+        flex: 1;
+        color: #8b949e;
+        font-size: 12px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      button {
+        padding: 5px 11px;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        background: #21262d;
+        color: #e6edf3;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 12px;
+      }
+      button:hover {
+        filter: brightness(1.15);
+      }
+      label {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        color: #8b949e;
+        font-size: 12px;
+      }
+      #log {
+        flex: 1 1 auto;
+        margin: 0;
+        padding: 10px 14px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+        font-family: Consolas, 'Cascadia Mono', monospace;
+        font-size: 12px;
+        line-height: 1.55;
+        color: #c9d1d9;
+      }
+      .err {
+        color: #f85149;
+      }
+      .warn {
+        color: #d29922;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <button id="refresh">刷新</button>
+      <label><input type="checkbox" id="auto" checked /> 自动刷新(3s)</label>
+      <label><input type="checkbox" id="tail" checked /> 跟随末尾</label>
+      <span class="path" id="path"></span>
+      <button id="folder">打开所在文件夹</button>
+      <button id="clear">清空</button>
+    </header>
+    <pre id="log">加载中…</pre>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      let timer = null;
+
+      function classify(text) {
+        // 简单的关键词染色，方便扫读
+        return text
+          .split('\n')
+          .map((line) => {
+            const esc = line
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;');
+            if (/\[error\]|Error|failed|失败|EPIPE|uncaught/i.test(line)) {
+              return '<span class="err">' + esc + '</span>';
+            }
+            if (/\[warning\]|警告|WARN/i.test(line)) {
+              return '<span class="warn">' + esc + '</span>';
+            }
+            return esc;
+          })
+          .join('\n');
+      }
+
+      async function load() {
+        try {
+          const r = await window.dshPanel.readLog();
+          $('path').textContent = (r && r.path) || '';
+          const el = $('log');
+          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          el.innerHTML = classify((r && r.text) || '(日志为空)');
+          if ($('tail').checked && atBottom) el.scrollTop = el.scrollHeight;
+        } catch (e) {
+          $('log').innerHTML = '<span class="err">读取日志失败: ' + e.message + '</span>';
+        }
+      }
+
+      function applyAuto() {
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+        if ($('auto').checked) timer = setInterval(load, 3000);
+      }
+
+      $('refresh').addEventListener('click', load);
+      $('auto').addEventListener('change', applyAuto);
+      $('clear').addEventListener('click', async () => {
+        await window.dshPanel.clearLog();
+        await load();
+      });
+      $('folder').addEventListener('click', () => window.dshPanel.openLogFolder());
+
+      load();
+      applyAuto();
+    </script>
+  </body>
+</html>

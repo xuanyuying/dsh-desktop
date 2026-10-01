@@ -7,11 +7,48 @@
 
 const { Menu, shell, app } = require('electron');
 
+// 峰谷菜单项需动态更新（时段与倒计时每秒级变化），因此保留引用。
+// MenuItem 的 label/checked 在原位可变，无需重建整个菜单。
+let peakStatusItem = null;
+let peakAllowItem = null;
+let peakGuardItem = null;
+let minimizeToTrayItem = null;
+let autoLaunchItem = null;
+let currentMenu = null;
+
+/**
+ * 刷新峰谷菜单显示。
+ * @param {object} payload - main.js 的 buildPeakPayload() 结果
+ */
+function updatePeakMenu(payload) {
+  if (!payload) return;
+  if (peakStatusItem) {
+    const icon = payload.isPeak ? '🔴' : '🟢';
+    peakStatusItem.label =
+      icon + ' ' + payload.periodLabel + ' · ' + payload.discountLabel + ' · ' + payload.countdown;
+  }
+  if (peakGuardItem) {
+    peakGuardItem.checked = payload.guardEnabled !== false;
+  }
+  if (peakAllowItem) {
+    // 高峰且守卫启用时才有「放行」的意义
+    peakAllowItem.enabled = Boolean(payload.isPeak) && payload.guardEnabled !== false;
+    peakAllowItem.label = payload.allowed
+      ? '取消临时放行（恢复零消耗）'
+      : '临时放行至本时段结束';
+  }
+  if (currentMenu && process.platform === 'darwin') {
+    // macOS 的菜单标题不随属性变化，需要重新设置
+    Menu.setApplicationMenu(currentMenu);
+  }
+}
+
 /**
  * Build and set the application menu.
  * @param {object} handlers - callbacks provided by main.js
  *   { newSession, refreshPage, restartService, checkUpdate, openConfigDir,
- *     openInBrowser, showAbout, harnessUrl, getVersionInfo }
+ *     openInBrowser, showAbout, showPeakStatus, restartForPeakGuard,
+ *     setPeakGuard, allowPeakTemporarily }
  */
 function setupMenu(handlers) {
   const template = [
@@ -37,6 +74,11 @@ function setupMenu(handlers) {
         {
           label: '打开配置目录',
           click: () => handlers.openConfigDir(),
+        },
+        {
+          label: '设置…',
+          accelerator: 'CmdOrCtrl+,',
+          click: () => handlers.openSettings(),
         },
         { type: 'separator' },
         {
@@ -86,6 +128,31 @@ function setupMenu(handlers) {
           accelerator: 'F12',
           click: () => handlers.toggleDevTools(),
         },
+        { type: 'separator' },
+        (minimizeToTrayItem = {
+          label: '关闭时最小化到托盘',
+          type: 'checkbox',
+          checked:
+            typeof handlers.isMinimizeToTray === 'function'
+              ? handlers.isMinimizeToTray() === true
+              : false,
+          click: (item) => {
+            const actual = handlers.toggleMinimizeToTray(item.checked);
+            item.checked = actual === true;
+          },
+        }),
+        (autoLaunchItem = {
+          label: '开机自动启动',
+          type: 'checkbox',
+          checked:
+            typeof handlers.isAutoLaunchEnabled === 'function'
+              ? handlers.isAutoLaunchEnabled() === true
+              : false,
+          click: (item) => {
+            const actual = handlers.setAutoLaunch(item.checked);
+            item.checked = actual === true;
+          },
+        }),
       ],
     },
 
@@ -114,6 +181,52 @@ function setupMenu(handlers) {
           label: '打开服务日志',
           click: () => handlers.showServiceLog(),
         },
+        {
+          label: '内置日志查看器…',
+          accelerator: 'CmdOrCtrl+Shift+L',
+          click: () => handlers.openLogs(),
+        },
+        { type: 'separator' },
+        {
+          label: '结束占用端口的 dsh 服务…',
+          click: () => handlers.kickPortOwner(),
+        },
+      ],
+    },
+
+    // ---------------- Peak / Off-peak ----------------
+    {
+      label: '峰谷(P)',
+      submenu: [
+        (peakStatusItem = {
+          label: '🟢 时段判定中…',
+          click: () => handlers.showPeakStatus(),
+        }),
+        { type: 'separator' },
+        (peakGuardItem = {
+          label: '高峰时段零 token 消耗',
+          type: 'checkbox',
+          checked: true,
+          click: (item) => handlers.setPeakGuard(item.checked),
+        }),
+        (peakAllowItem = {
+          label: '临时放行至本时段结束',
+          click: () => handlers.allowPeakTemporarily(),
+        }),
+        { type: 'separator' },
+        {
+          label: '查看时段详情…',
+          click: () => handlers.showPeakStatus(),
+        },
+        {
+          label: '重启服务以启用保护',
+          click: () => handlers.restartForPeakGuard(),
+        },
+        { type: 'separator' },
+        {
+          label: '官方计价说明',
+          click: () => shell.openExternal('https://api-docs.deepseek.com/quick_start/pricing'),
+        },
       ],
     },
 
@@ -135,6 +248,10 @@ function setupMenu(handlers) {
         },
         { type: 'separator' },
         {
+          label: '检查 DSH Desktop 更新…',
+          click: () => handlers.checkDesktopUpdate(),
+        },
+        {
           label: '关于 DSH Desktop',
           click: () => handlers.showAbout(),
         },
@@ -142,9 +259,9 @@ function setupMenu(handlers) {
     },
   ];
 
-  const menu = Menu.buildFromTemplate(template);
-  Menu.setApplicationMenu(menu);
-  return menu;
+  currentMenu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(currentMenu);
+  return currentMenu;
 }
 
-module.exports = { setupMenu };
+module.exports = { setupMenu, updatePeakMenu };
